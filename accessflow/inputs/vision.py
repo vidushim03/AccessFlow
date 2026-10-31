@@ -44,8 +44,8 @@ class VisionWorker(QThread):
         self.smoothed = None
         self.last_hand_seen = 0.0
         self.pointer_filters = {
-            "gestures": OneEuroFilter2D(0.4, 0.06),
-            "gaze": OneEuroFilter2D(0.35, 0.035),
+            "gestures": OneEuroFilter2D(0.4, 0.04),
+            "gaze": OneEuroFilter2D(0.12, 0.005),
         }
         self.gaze_transform = np.asarray(gaze_transform, dtype=float) if gaze_transform is not None else None
 
@@ -162,7 +162,7 @@ class VisionWorker(QThread):
                             if self.gaze_transform is not None:
                                 raw = np.array([rx, ry, 1.0]) @ self.gaze_transform
                                 raw = (max(0.0, min(1.0, float(raw[0]))), max(0.0, min(1.0, float(raw[1]))))
-                                sx, sy = self._smooth_pointer("gaze", raw[0], raw[1], 35.0, 2.0)
+                                sx, sy = self._smooth_pointer("gaze", raw[0], raw[1], 25.0, 4.0)
                                 self.event_ready.emit(InteractionEvent("gaze", "gaze", "move_pointer", 0.82, {
                                     "x": int(sx * (self.width - 1)), "y": int(sy * (self.height - 1))}))
                 elif hand_seen:

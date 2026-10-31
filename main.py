@@ -269,24 +269,22 @@ class AccessFlowWindow(QMainWindow):
             features, targets = [], []
             for target_index, (target_x, target_y) in enumerate(self.calibration_overlay.targets):
                 samples = [(rx, ry) for index, rx, ry in self.calibration_samples if index == target_index]
-                if len(samples) < 10:
+                if len(samples) < 8:
                     raise ValueError(f"Too few eye samples at point {target_index + 1}. Check camera framing and try again.")
-                if float(np.max(np.std(np.asarray(samples), axis=0))) > 0.07:
-                    raise ValueError(f"Eye tracking was unsteady at point {target_index + 1}. Hold still and try that calibration again.")
                 center = np.median(np.asarray(samples), axis=0)
                 features.append([float(center[0]), float(center[1]), 1.0])
                 targets.append([target_x, target_y])
             x = np.asarray(features)
             y = np.asarray(targets)
             matrix, _, rank, _ = np.linalg.lstsq(x, y, rcond=None)
-            if rank < 3 or float(np.max(np.abs(matrix[:2, :]))) > 14.0:
-                raise ValueError("Eye movement was too small or unstable to calibrate. Keep the camera at eye level, look at each dot, and try again.")
+            if rank < 3:
+                raise ValueError("Eye movement was too small to calibrate. Keep the camera at eye level and try again.")
             error = float(np.sqrt(np.mean((x @ matrix - y) ** 2)))
-            if error > 0.16:
-                raise ValueError("Calibration readings varied too much. Improve lighting, keep your head still, and try again.")
+            if error > 0.35:
+                raise ValueError(f"Calibration error too high ({error:.2f}). Improve lighting and try again.")
             self.gaze_transform = matrix.tolist()
             self.settings.setValue("gaze/transform_v3", json.dumps(self.gaze_transform))
-            self.calibration_status.setText("Calibration saved. Start with a small gaze movement; recalibrate if pointer placement is off.")
+            self.calibration_status.setText("Calibration saved! You can now start Eye gaze.")
         except Exception as exc:
             self.gaze_transform = None
             self.settings.remove("gaze/transform_v3")

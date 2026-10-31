@@ -1,9 +1,12 @@
+import ctypes
 import subprocess
 import pyautogui
 from pywinauto import Desktop
 
 # Disable PyAutoGUI's corner failsafe exception so edge coordinates don't crash
 pyautogui.FAILSAFE = False
+
+_user32 = ctypes.windll.user32
 
 
 class WindowsActions:
@@ -14,11 +17,26 @@ class WindowsActions:
         "calculator": "calc.exe",
     }
 
+    def __init__(self):
+        # Ensure process thread attaches to active input desktop
+        self._attach_input_desktop()
+
+    @staticmethod
+    def _attach_input_desktop():
+        try:
+            hdesk = _user32.OpenInputDesktop(0, False, 0x01FF)
+            if hdesk:
+                _user32.SetThreadDesktop(hdesk)
+                _user32.CloseDesktop(hdesk)
+        except Exception:
+            pass
+
     def screen_size(self):
         """Return physical pixel dimensions matching PyAutoGUI coordinates."""
         return tuple(pyautogui.size())
 
     def move_pointer(self, x, y):
+        self._attach_input_desktop()
         pyautogui.moveTo(int(x), int(y), duration=0)
 
     def click(self, button="left", clicks=1):
