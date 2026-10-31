@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import sys
 import time
@@ -236,6 +237,7 @@ class AccessFlowWindow(QMainWindow):
         self.calibration_target_index = 0
         self.calibration_target_started = time.monotonic()
         screen = QApplication.primaryScreen().geometry()
+        pointer_width, pointer_height = self.actions.screen_size()
         self.calibration_overlay = CalibrationOverlay(0)
         self.calibration_overlay.setGeometry(screen)
         self.calibration_overlay.showFullScreen()

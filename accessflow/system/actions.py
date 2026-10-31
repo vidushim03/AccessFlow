@@ -2,6 +2,9 @@ import subprocess
 import pyautogui
 from pywinauto import Desktop
 
+# Disable PyAutoGUI's corner failsafe exception so edge coordinates don't crash
+pyautogui.FAILSAFE = False
+
 
 class WindowsActions:
     """Windows controls behind the interaction engine."""
