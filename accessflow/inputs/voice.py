@@ -1,4 +1,5 @@
 import json
+import math
 import os
 import queue
 import urllib.request
@@ -56,26 +57,28 @@ class VoiceWorker(QThread):
         self.stop_requested = True
         self.wait(3000)
 
-    def _phrase(self, value):
+    def _phrase(self, value, confidence):
         text = value.lower().strip()
+        confidence = float(confidence)
+        if not text or not math.isfinite(confidence) or confidence < 0.72:
+            return
         if text in ("pause accessflow", "stop accessflow", "emergency pause"):
-            event = InteractionEvent("voice", "emergency_pause", "pause")
+            event = InteractionEvent("voice", "emergency_pause", "pause", confidence)
         elif text in ("left click", "click"):
-            event = InteractionEvent("voice", "command", "click", .88, {"button": "left"})
+            event = InteractionEvent("voice", "command", "click", confidence, {"button": "left"})
         elif text == "right click":
-            event = InteractionEvent("voice", "command", "click", .88, {"button": "right"})
+            event = InteractionEvent("voice", "command", "click", confidence, {"button": "right"})
         elif text == "scroll up":
-            event = InteractionEvent("voice", "command", "scroll", .88, {"amount": 3})
+            event = InteractionEvent("voice", "command", "scroll", confidence, {"amount": 3})
         elif text == "scroll down":
-            event = InteractionEvent("voice", "command", "scroll", .88, {"amount": -3})
+            event = InteractionEvent("voice", "command", "scroll", confidence, {"amount": -3})
         elif text in ("open notepad", "open calculator"):
-            event = InteractionEvent("voice", "command", "open_application", .90, {"name": text[5:]})
-        elif text.startswith("type "):
-            event = InteractionEvent("voice", "dictation", "type_text", .82, {"text": text[5:]})
+            event = InteractionEvent("voice", "command", "open_application", confidence, {"name": text[5:]})
+        elif text.startswith("type ") and len(text) > 5:
+            event = InteractionEvent("voice", "dictation", "type_text", confidence, {"text": text[5:]})
         else:
             return
         self.event_ready.emit(event)
-
     def run(self):
         try:
             model = Model(self.model_directory)
@@ -93,10 +96,14 @@ class VoiceWorker(QThread):
                     except queue.Empty:
                         continue
                     if recognizer.AcceptWaveform(data):
-                        phrase = json.loads(recognizer.Result()).get("text", "")
-                        if phrase:
-                            self._phrase(phrase)
+                        result = json.loads(recognizer.Result())
+                        phrase = result.get("text", "")
+                        words = result.get("result", [])
+                        scores = [float(word.get("conf", 0.0)) for word in words if "conf" in word]
+                        if phrase and scores and len(scores) == len(words):
+                            self._phrase(phrase, min(scores))
         except Exception as exc:
             self.status.emit(f"Voice input stopped: {exc}")
         finally:
             self.status.emit("Voice input stopped")
+

@@ -20,3 +20,11 @@ Dependencies are listed in requirements.txt.
 Eye gaze requires the nine-point calibration wizard; pointer movement stays disabled until calibration is saved. Calibration quality depends on camera position, lighting, and the individual user. Providers are opt-in. Use Escape or Emergency pause to stop them.
 
 
+## Input stability
+
+- Camera pointer coordinates use speed-adaptive filtering, a small-motion dead zone, and per-frame movement limits. Brief hand-tracking dropouts do not immediately switch control to gaze.
+- Gaze calibration waits for the camera model, ignores target-transition frames, takes a median reading per point, and rejects unstable or poor-fit results.
+- Pinch uses a hand-size-relative distance, an 80 ms hold, separate enter/exit thresholds, and a click cooldown.
+- Voice commands use Vosk word confidence; low-confidence recognition is discarded.
+
+The changes have passed syntax and import checks. Live webcam, calibration, and microphone behavior still needs validation on this device.

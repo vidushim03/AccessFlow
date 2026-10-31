@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import sys
+import time
 from pathlib import Path
 
 from PySide6.QtCore import Qt, QSettings, Signal, QObject, QTimer, QRect
@@ -67,7 +68,7 @@ class AccessFlowWindow(QMainWindow):
         self.voice_worker = None
         self.running = False
         self.gaze_transform = None
-        saved_transform = self.settings.value("gaze/transform", "")
+        saved_transform = self.settings.value("gaze/transform_v2", "")
         if saved_transform:
             try:
                 self.gaze_transform = json.loads(saved_transform)
@@ -75,6 +76,7 @@ class AccessFlowWindow(QMainWindow):
                 self.gaze_transform = None
         self.calibration_samples = []
         self.calibration_target_index = 0
+        self.calibration_target_started = 0.0
         self.calibration_timer = QTimer(self)
         self.calibration_timer.timeout.connect(self._next_calibration_target)
         self.calibration_overlay = None
@@ -232,6 +234,7 @@ class AccessFlowWindow(QMainWindow):
             return
         self.calibration_samples = []
         self.calibration_target_index = 0
+        self.calibration_target_started = time.monotonic()
         screen = QApplication.primaryScreen().geometry()
         self.calibration_overlay = CalibrationOverlay(0)
         self.calibration_overlay.setGeometry(screen)
@@ -242,17 +245,17 @@ class AccessFlowWindow(QMainWindow):
         self.vision_worker.gaze_sample.connect(self._collect_gaze_sample)
         self.vision_worker.status.connect(self._calibration_status)
         self.vision_worker.start()
-        self.calibration_status.setText("Calibrating point 1 of 9…")
-        self.calibration_timer.start(2000)
+        self.calibration_status.setText("Preparing camera and gaze model…")
 
     def _collect_gaze_sample(self, sample):
-        if not self.calibration_timer.isActive():
+        if not self.calibration_timer.isActive() or time.monotonic() - self.calibration_target_started < 0.25:
             return
         self.calibration_samples.append((self.calibration_target_index, float(sample[0]), float(sample[1])))
 
     def _next_calibration_target(self):
         if self.calibration_target_index < 8:
             self.calibration_target_index += 1
+            self.calibration_target_started = time.monotonic()
             self.calibration_overlay.target_index = self.calibration_target_index
             self.calibration_overlay.update()
             self.calibration_status.setText(f"Calibrating point {self.calibration_target_index + 1} of 9…")
@@ -262,25 +265,38 @@ class AccessFlowWindow(QMainWindow):
         try:
             import numpy as np
             features, targets = [], []
-            for index, rx, ry in self.calibration_samples:
-                x, y = self.calibration_overlay.targets[index]
-                features.append([rx, ry, 1.0])
-                targets.append([x, y])
-            if len(features) < 18 or len(set(index for index, _, _ in self.calibration_samples)) < 9:
-                raise ValueError("Not enough eye samples. Ensure the camera can see both eyes and try again.")
-            matrix, _, rank, _ = np.linalg.lstsq(np.asarray(features), np.asarray(targets), rcond=None)
-            if rank < 3:
-                raise ValueError("Eye movement was too small to calculate a mapping. Try again with the camera at eye level.")
+            for target_index, (target_x, target_y) in enumerate(self.calibration_overlay.targets):
+                samples = [(rx, ry) for index, rx, ry in self.calibration_samples if index == target_index]
+                if len(samples) < 10:
+                    raise ValueError(f"Too few eye samples at point {target_index + 1}. Check camera framing and try again.")
+                if float(np.max(np.std(np.asarray(samples), axis=0))) > 0.07:
+                    raise ValueError(f"Eye tracking was unsteady at point {target_index + 1}. Hold still and try that calibration again.")
+                center = np.median(np.asarray(samples), axis=0)
+                features.append([float(center[0]), float(center[1]), 1.0])
+                targets.append([target_x, target_y])
+            x = np.asarray(features)
+            y = np.asarray(targets)
+            matrix, _, rank, _ = np.linalg.lstsq(x, y, rcond=None)
+            if rank < 3 or float(np.max(np.abs(matrix[:2, :]))) > 14.0:
+                raise ValueError("Eye movement was too small or unstable to calibrate. Keep the camera at eye level, look at each dot, and try again.")
+            error = float(np.sqrt(np.mean((x @ matrix - y) ** 2)))
+            if error > 0.16:
+                raise ValueError("Calibration readings varied too much. Improve lighting, keep your head still, and try again.")
             self.gaze_transform = matrix.tolist()
-            self.settings.setValue("gaze/transform", json.dumps(self.gaze_transform))
-            self.calibration_status.setText("Calibration saved on this computer. Enable Eye gaze and start a session to use it.")
+            self.settings.setValue("gaze/transform_v2", json.dumps(self.gaze_transform))
+            self.calibration_status.setText("Calibration saved. Start with a small gaze movement; recalibrate if pointer placement is off.")
         except Exception as exc:
+            self.gaze_transform = None
+            self.settings.remove("gaze/transform_v2")
             self.calibration_status.setText(f"Calibration did not finish: {exc}")
         finally:
             self._stop_calibration()
-
     def _calibration_status(self, message):
-        if message.startswith("Camera stopped"):
+        if message == "Camera inputs active":
+            self.calibration_target_started = time.monotonic()
+            self.calibration_status.setText("Calibrating point 1 of 9…")
+            self.calibration_timer.start(2000)
+        elif message.startswith("Camera stopped") or message == "Camera unavailable":
             self.calibration_timer.stop()
             self.calibration_status.setText(message)
             self._stop_calibration()
@@ -481,13 +497,4 @@ def main():
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
-
-
-
-
-
-
-
-
 

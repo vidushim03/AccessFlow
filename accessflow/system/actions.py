@@ -12,7 +12,7 @@ class WindowsActions:
     }
 
     def move_pointer(self, x, y):
-        pyautogui.moveTo(int(x), int(y), duration=0.06)
+        pyautogui.moveTo(int(x), int(y), duration=0)
 
     def click(self, button="left", clicks=1):
         pyautogui.click(button=button, clicks=max(1, min(int(clicks), 2)))
@@ -41,3 +41,4 @@ class WindowsActions:
         if not window.exists(timeout=1) or not control.exists(timeout=1):
             raise LookupError("The requested control was not found")
         control.click_input()
+

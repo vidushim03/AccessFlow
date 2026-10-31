@@ -1,3 +1,4 @@
+import math
 import os
 import time
 import urllib.request
@@ -10,6 +11,7 @@ from PySide6.QtCore import QThread, Signal
 from mediapipe.tasks.python.core.base_options import BaseOptions
 from mediapipe.tasks.python.vision import FaceLandmarker, FaceLandmarkerOptions, HandLandmarker, HandLandmarkerOptions, RunningMode
 from accessflow.core.events import InteractionEvent
+from accessflow.inputs.filters import OneEuroFilter2D
 
 FACE_URL = "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task"
 HAND_URL = "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task"
@@ -37,9 +39,32 @@ class VisionWorker(QThread):
         self.gaze_enabled, self.gestures_enabled = gaze_enabled, gestures_enabled
         self.stop_requested = False
         self.previous_pinch = False
+        self.last_pinch_click = 0.0
+        self.pinch_started_at = None
         self.smoothed = None
+        self.last_hand_seen = 0.0
+        self.pointer_filters = {
+            "gestures": OneEuroFilter2D(0.4, 0.06),
+            "gaze": OneEuroFilter2D(0.35, 0.035),
+        }
         self.gaze_transform = np.asarray(gaze_transform, dtype=float) if gaze_transform is not None else None
 
+    def _smooth_pointer(self, source, x, y, max_step_px, deadzone_px):
+        filtered = self.pointer_filters[source].update((x, y), time.monotonic())
+        current = self.smoothed
+        if current is None:
+            current = filtered
+        else:
+            dx = (filtered[0] - current[0]) * self.width
+            dy = (filtered[1] - current[1]) * self.height
+            if math.hypot(dx, dy) < deadzone_px:
+                return current
+            dx = max(-max_step_px, min(max_step_px, dx))
+            dy = max(-max_step_px, min(max_step_px, dy))
+            current = (max(0.0, min(1.0, current[0] + dx / self.width)),
+                       max(0.0, min(1.0, current[1] + dy / self.height)))
+        self.smoothed = current
+        return current
     def stop(self):
         self.stop_requested = True
         self.wait(3000)
@@ -56,11 +81,14 @@ class VisionWorker(QThread):
             if self.gaze_enabled:
                 face = FaceLandmarker.create_from_options(FaceLandmarkerOptions(
                     base_options=BaseOptions(model_asset_path=_model_path("face_landmarker.task", FACE_URL)),
-                    running_mode=RunningMode.VIDEO, num_faces=1))
+                    running_mode=RunningMode.VIDEO, num_faces=1,
+                    min_face_detection_confidence=0.70, min_face_presence_confidence=0.60,
+                    min_tracking_confidence=0.65))
             if self.gestures_enabled:
                 hand = HandLandmarker.create_from_options(HandLandmarkerOptions(
                     base_options=BaseOptions(model_asset_path=_model_path("hand_landmarker.task", HAND_URL)),
-                    running_mode=RunningMode.VIDEO, num_hands=1))
+                    running_mode=RunningMode.VIDEO, num_hands=1, min_hand_detection_confidence=0.70,
+                    min_hand_presence_confidence=0.60, min_tracking_confidence=0.65))
             self.status.emit("Camera inputs active")
             timestamp = int(time.monotonic() * 1000)
             while not self.stop_requested:
@@ -75,17 +103,30 @@ class VisionWorker(QThread):
                     hands = hand.detect_for_video(image, timestamp).hand_landmarks
                     if hands:
                         hand_seen = True
+                        self.last_hand_seen = time.monotonic()
                         points = hands[0]
                         index_tip, thumb_tip = points[8], points[4]
-                        x = int(max(0, min(1, index_tip.x)) * (self.width - 1))
-                        y = int(max(0, min(1, index_tip.y)) * (self.height - 1))
+                        sx, sy = self._smooth_pointer("gestures", index_tip.x, index_tip.y, 70.0, 3.0)
+                        x = int(sx * (self.width - 1))
+                        y = int(sy * (self.height - 1))
                         self.event_ready.emit(InteractionEvent("gestures", "pointer", "move_pointer", 0.86, {"x": x, "y": y}))
-                        pinch = ((index_tip.x-thumb_tip.x)**2 + (index_tip.y-thumb_tip.y)**2)**0.5 < 0.055
-                        if pinch and not self.previous_pinch:
-                            self.event_ready.emit(InteractionEvent("gestures", "pinch", "click", 0.90, {"button": "left"}))
-                        self.previous_pinch = pinch
+                        palm_size = math.hypot(points[0].x - points[9].x, points[0].y - points[9].y)
+                        pinch_ratio = math.hypot(index_tip.x - thumb_tip.x, index_tip.y - thumb_tip.y) / max(palm_size, 0.001)
+                        now = time.monotonic()
+                        if not self.previous_pinch and pinch_ratio <= 0.32:
+                            if self.pinch_started_at is None:
+                                self.pinch_started_at = now
+                            elif now - self.pinch_started_at >= 0.08 and now - self.last_pinch_click >= 0.70:
+                                self.event_ready.emit(InteractionEvent("gestures", "pinch", "click", 0.90, {"button": "left"}))
+                                self.previous_pinch = True
+                                self.last_pinch_click = now
+                        elif self.previous_pinch and pinch_ratio >= 0.48:
+                            self.previous_pinch = False
+                            self.pinch_started_at = None
+                        elif not self.previous_pinch and pinch_ratio > 0.32:
+                            self.pinch_started_at = None
                 # A visible hand owns the camera interaction for this frame; this avoids gaze/gesture cursor contention.
-                if face and not hand_seen:
+                if face and not hand_seen and (not self.gestures_enabled or time.monotonic() - self.last_hand_seen > 0.5):
                     faces = face.detect_for_video(image, timestamp).face_landmarks
                     if faces:
                         marks = faces[0]
@@ -103,9 +144,9 @@ class VisionWorker(QThread):
                             if self.gaze_transform is not None:
                                 raw = np.array([rx, ry, 1.0]) @ self.gaze_transform
                                 raw = (max(0.0, min(1.0, float(raw[0]))), max(0.0, min(1.0, float(raw[1]))))
-                                self.smoothed = raw if self.smoothed is None else tuple(.22*raw[i]+.78*self.smoothed[i] for i in (0,1))
+                                sx, sy = self._smooth_pointer("gaze", raw[0], raw[1], 28.0, 2.0)
                                 self.event_ready.emit(InteractionEvent("gaze", "gaze", "move_pointer", 0.82, {
-                                    "x": int(self.smoothed[0]*(self.width-1)), "y": int(self.smoothed[1]*(self.height-1))}))
+                                    "x": int(sx*(self.width-1)), "y": int(sy*(self.height-1))}))
         except Exception as exc:
             self.status.emit(f"Camera stopped: {exc}")
         finally:
@@ -116,7 +157,4 @@ class VisionWorker(QThread):
             if capture:
                 capture.release()
             self.status.emit("Camera inputs stopped")
-
-
-
 
