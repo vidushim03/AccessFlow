@@ -11,6 +11,10 @@ class WindowsActions:
         "calculator": "calc.exe",
     }
 
+    def screen_size(self):
+        """Return physical pixel dimensions matching PyAutoGUI coordinates."""
+        return tuple(pyautogui.size())
+
     def move_pointer(self, x, y):
         pyautogui.moveTo(int(x), int(y), duration=0)
 

@@ -241,7 +241,7 @@ class AccessFlowWindow(QMainWindow):
         self.calibration_overlay.showFullScreen()
         self.calibration_overlay.cancelled.connect(self._stop_calibration)
         self.calibration_overlay.installEventFilter(self)
-        self.vision_worker = VisionWorker(screen.width(), screen.height(), True, False)
+        self.vision_worker = VisionWorker(pointer_width, pointer_height, True, False)
         self.vision_worker.gaze_sample.connect(self._collect_gaze_sample)
         self.vision_worker.status.connect(self._calibration_status)
         self.vision_worker.start()
@@ -423,8 +423,8 @@ class AccessFlowWindow(QMainWindow):
         self.session_card.layout().itemAt(1).widget().setText(", ".join(sources) if sources else "No input methods selected")
 
         if gaze or gestures:
-            screen = QApplication.primaryScreen().geometry()
-            self.vision_worker = VisionWorker(screen.width(), screen.height(), gaze, gestures, self.gaze_transform)
+            pointer_width, pointer_height = self.actions.screen_size()
+            self.vision_worker = VisionWorker(pointer_width, pointer_height, gaze, gestures, self.gaze_transform)
             self.vision_worker.event_ready.connect(self._on_event)
             self.vision_worker.status.connect(self.status_label.setText)
             self.vision_worker.start()

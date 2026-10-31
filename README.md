@@ -28,3 +28,4 @@ Eye gaze requires the nine-point calibration wizard; pointer movement stays disa
 - Voice commands use Vosk word confidence; low-confidence recognition is discarded.
 
 The changes have passed syntax and import checks. Live webcam, calibration, and microphone behavior still needs validation on this device.
+- Camera output coordinates use PyAutoGUI’s physical-pixel screen size, matching Windows display scaling.
