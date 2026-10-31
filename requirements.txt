@@ -1,0 +1,9 @@
+PySide6-Essentials
+PyAutoGUI
+pywinauto
+numpy
+scipy
+opencv-contrib-python
+mediapipe==1.0.1
+sounddevice
+vosk
