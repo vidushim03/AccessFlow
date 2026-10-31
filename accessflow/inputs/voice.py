@@ -83,6 +83,7 @@ class VoiceWorker(QThread):
         try:
             model = Model(self.model_directory)
             recognizer = KaldiRecognizer(model, 16000)
+            recognizer.SetWords(True)
 
             def callback(indata, frames, timing, status):
                 if not self.stop_requested:

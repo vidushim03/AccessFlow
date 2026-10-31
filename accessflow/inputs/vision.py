@@ -65,6 +65,32 @@ class VisionWorker(QThread):
                        max(0.0, min(1.0, current[1] + dy / self.height)))
         self.smoothed = current
         return current
+
+    @staticmethod
+    def _extract_gaze_feature(marks):
+        """Invariant 2D gaze feature in eye-corner coordinates.
+        Computes iris position along the eye-corner axis and perpendicular offset,
+        making tracking robust against head tilt, distance changes, and roll."""
+        features = []
+        # Left eye: iris=468, corners outer=33, inner=133
+        # Right eye: iris=473, corners inner=362, outer=263
+        for iris_idx, a_idx, b_idx in ((468, 33, 133), (473, 362, 263)):
+            iris, a, b = marks[iris_idx], marks[a_idx], marks[b_idx]
+            axis_x = b.x - a.x
+            axis_y = b.y - a.y
+            width_sq = axis_x * axis_x + axis_y * axis_y
+            if width_sq < 1e-6:
+                continue
+            rel_x = iris.x - a.x
+            rel_y = iris.y - a.y
+            x = (rel_x * axis_x + rel_y * axis_y) / width_sq
+            y = (axis_x * rel_y - axis_y * rel_x) / width_sq
+            features.append((x, y))
+        if not features:
+            return None
+        return (sum(f[0] for f in features) / len(features),
+                sum(f[1] for f in features) / len(features))
+
     def stop(self):
         self.stop_requested = True
         self.wait(3000)
@@ -129,24 +155,19 @@ class VisionWorker(QThread):
                 if face and not hand_seen and (not self.gestures_enabled or time.monotonic() - self.last_hand_seen > 0.5):
                     faces = face.detect_for_video(image, timestamp).face_landmarks
                     if faces:
-                        marks = faces[0]
-                        ratios = []
-                        for iris, aidx, bidx, upper, lower in ((468,33,133,159,145),(473,362,263,386,374)):
-                            a, b, eye = marks[aidx], marks[bidx], marks[iris]
-                            width = abs(b.x-a.x)
-                            if width > 0.002:
-                                ratios.append(((eye.x-min(a.x,b.x))/width,
-                                               (eye.y-(marks[upper].y+marks[lower].y)/2)/width))
-                        if ratios:
-                            rx = sum(v[0] for v in ratios)/len(ratios)
-                            ry = sum(v[1] for v in ratios)/len(ratios)
+                        gaze_feat = self._extract_gaze_feature(faces[0])
+                        if gaze_feat is not None:
+                            rx, ry = gaze_feat
                             self.gaze_sample.emit((rx, ry))
                             if self.gaze_transform is not None:
                                 raw = np.array([rx, ry, 1.0]) @ self.gaze_transform
                                 raw = (max(0.0, min(1.0, float(raw[0]))), max(0.0, min(1.0, float(raw[1]))))
-                                sx, sy = self._smooth_pointer("gaze", raw[0], raw[1], 28.0, 2.0)
+                                sx, sy = self._smooth_pointer("gaze", raw[0], raw[1], 35.0, 2.0)
                                 self.event_ready.emit(InteractionEvent("gaze", "gaze", "move_pointer", 0.82, {
-                                    "x": int(sx*(self.width-1)), "y": int(sy*(self.height-1))}))
+                                    "x": int(sx * (self.width - 1)), "y": int(sy * (self.height - 1))}))
+                elif hand_seen:
+                    # Clear gaze filter state when hand is active so there is no residual drift on hand release
+                    self.pointer_filters["gaze"].reset()
         except Exception as exc:
             self.status.emit(f"Camera stopped: {exc}")
         finally:

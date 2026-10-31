@@ -69,7 +69,7 @@ class AccessFlowWindow(QMainWindow):
         self.voice_worker = None
         self.running = False
         self.gaze_transform = None
-        saved_transform = self.settings.value("gaze/transform_v2", "")
+        saved_transform = self.settings.value("gaze/transform_v3", "")
         if saved_transform:
             try:
                 self.gaze_transform = json.loads(saved_transform)
@@ -285,11 +285,11 @@ class AccessFlowWindow(QMainWindow):
             if error > 0.16:
                 raise ValueError("Calibration readings varied too much. Improve lighting, keep your head still, and try again.")
             self.gaze_transform = matrix.tolist()
-            self.settings.setValue("gaze/transform_v2", json.dumps(self.gaze_transform))
+            self.settings.setValue("gaze/transform_v3", json.dumps(self.gaze_transform))
             self.calibration_status.setText("Calibration saved. Start with a small gaze movement; recalibrate if pointer placement is off.")
         except Exception as exc:
             self.gaze_transform = None
-            self.settings.remove("gaze/transform_v2")
+            self.settings.remove("gaze/transform_v3")
             self.calibration_status.setText(f"Calibration did not finish: {exc}")
         finally:
             self._stop_calibration()
