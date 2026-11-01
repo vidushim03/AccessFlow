@@ -16,9 +16,11 @@ Dependencies are listed in requirements.txt.
 - Supported voice commands include left click, right click, scroll up/down, open Notepad/Calculator, and “type …”. “Pause AccessFlow” stops all active providers.
 - All events pass through the confidence/source gate before reaching WindowsActions.
 - pywinauto is used for named control clicks and window activation; PyAutoGUI provides coordinate mouse/keyboard actions.
+- Escape is observed system-wide, so it pauses a running session even when another app has focus. The key is not consumed, so the focused app still receives it normally. Input aimed at elevated (administrator) windows cannot be observed.
+- The touchpad and mouse are never disabled. When real touchpad or mouse movement is detected, camera pointer output (including pinch clicks) steps aside for 1.5 seconds, then resumes automatically.
 - Settings persist locally with QSettings. AccessFlow does not record raw audio or video.
 
-Eye gaze requires the nine-point calibration wizard; pointer movement stays disabled until calibration is saved. Head tracking does not use the gaze calibration. Eye gaze and head tracking are mutually exclusive, so selecting one turns the other off. Calibration quality depends on camera position, lighting, and the individual user. Providers are opt-in. Use Escape or Emergency pause to stop them; the UI pauses immediately and camera/audio workers finish shutting down in the background.
+Eye gaze requires the nine-point calibration wizard; pointer movement stays disabled until calibration is saved. Head tracking does not use the gaze calibration. Eye gaze and head tracking are mutually exclusive, so selecting one turns the other off. Calibration quality depends on camera position, lighting, and the individual user. Providers are opt-in. Use Escape from any application or Emergency pause to stop them; the UI pauses immediately and camera/audio workers finish shutting down in the background.
 
 
 ## Input stability

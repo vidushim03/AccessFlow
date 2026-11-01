@@ -16,6 +16,7 @@ from PySide6.QtWidgets import (
 )
 
 from accessflow.core.engine import InteractionEngine
+from accessflow.system.hotkey import GlobalEscapeListener, GlobalPointerActivity
 from accessflow.system.actions import WindowsActions
 from accessflow.inputs.vision import VisionWorker
 from accessflow.inputs.voice import VoiceModelDownloadWorker, VoiceWorker
@@ -97,6 +98,14 @@ class AccessFlowWindow(QMainWindow):
         self._restore_settings()
         self.esc_shortcut = QShortcut(QKeySequence("Esc"), self)
         self.esc_shortcut.activated.connect(self._pause)
+        self.esc_listener = GlobalEscapeListener(self)
+        self.esc_listener.escaped.connect(self._global_escape)
+        self.pointer_listener = GlobalPointerActivity(self)
+        self.pointer_listener.activity.connect(self._touchpad_takeover)
+        if sys.platform == "win32":
+            self.esc_listener.start()
+            self.pointer_listener.start()
+        QApplication.instance().aboutToQuit.connect(self._stop_global_listeners)
 
     def _build_ui(self):
         root = QWidget()
@@ -543,7 +552,25 @@ class AccessFlowWindow(QMainWindow):
         self.session_card.layout().itemAt(1).widget().setText("Camera and microphone are off.")
         self.engine.pause()
 
+    def _global_escape(self):
+        # The hook does not consume Escape, so the focused app still gets it.
+        if (self.running or self._pending_start or self._pending_calibration
+                or self.calibration_overlay is not None):
+            self._pause()
+
+    def _touchpad_takeover(self):
+        # Real mouse/touchpad movement: let the camera pointer step aside briefly.
+        if self.running and self.vision_worker is not None:
+            self.vision_worker.suspend_pointer()
+
+    def _stop_global_listeners(self):
+        for listener in (self.esc_listener, self.pointer_listener):
+            if listener.isRunning():
+                listener.stop()
+
     def _quit(self):
+        # Stop observing input before any deferred shutdown begins.
+        self._stop_global_listeners()
         self._pause()
         if self._retiring_workers:
             self._quitting = True

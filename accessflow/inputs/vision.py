@@ -49,6 +49,7 @@ class VisionWorker(QThread):
         self.smoothed = None
         self.last_hand_seen = 0.0
         self.last_pointer_time = None
+        self.pointer_suspended_until = 0.0
         self.head_origin = None
         self.recenter_requested = False
         self.pointer_filters = {
@@ -133,6 +134,13 @@ class VisionWorker(QThread):
     def recenter_head(self):
         self.recenter_requested = True
 
+    def suspend_pointer(self, seconds=1.5):
+        """Hand the pointer back to the touchpad/mouse for a short while."""
+        self.pointer_suspended_until = time.monotonic() + seconds
+        self.smoothed = None
+        for pointer_filter in self.pointer_filters.values():
+            pointer_filter.reset()
+
     def stop(self):
         """Ask the worker to stop without blocking the caller.
 
@@ -200,6 +208,7 @@ class VisionWorker(QThread):
                 rgb = cv2.cvtColor(cv2.flip(frame, 1), cv2.COLOR_BGR2RGB)
                 image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
                 timestamp += 34
+                pointer_active = now >= self.pointer_suspended_until
                 hand_seen = False
                 if hand:
                     hands = hand.detect_for_video(image, timestamp).hand_landmarks
@@ -211,7 +220,8 @@ class VisionWorker(QThread):
                         sx, sy = self._smooth_pointer("gestures", index_tip.x, index_tip.y, 70.0, 3.0)
                         x = int(sx * (self.width - 1))
                         y = int(sy * (self.height - 1))
-                        self.event_ready.emit(InteractionEvent("gestures", "pointer", "move_pointer", 0.86, {"x": x, "y": y}))
+                        if pointer_active:
+                            self.event_ready.emit(InteractionEvent("gestures", "pointer", "move_pointer", 0.86, {"x": x, "y": y}))
                         palm_size = math.hypot(points[0].x - points[9].x, points[0].y - points[9].y)
                         pinch_ratio = math.hypot(index_tip.x - thumb_tip.x, index_tip.y - thumb_tip.y) / max(palm_size, 0.001)
                         now = time.monotonic()
@@ -219,7 +229,8 @@ class VisionWorker(QThread):
                             if self.pinch_started_at is None:
                                 self.pinch_started_at = now
                             elif now - self.pinch_started_at >= 0.08 and now - self.last_pinch_click >= 0.70:
-                                self.event_ready.emit(InteractionEvent("gestures", "pinch", "click", 0.90, {"button": "left"}))
+                                if pointer_active:
+                                    self.event_ready.emit(InteractionEvent("gestures", "pinch", "click", 0.90, {"button": "left"}))
                                 self.previous_pinch = True
                                 self.last_pinch_click = now
                         elif self.previous_pinch and pinch_ratio >= 0.48:
@@ -248,8 +259,9 @@ class VisionWorker(QThread):
                                     raw = (max(0.0, min(1.0, float(raw[0]))), max(0.0, min(1.0, float(raw[1]))))
                                     sx, sy = self._smooth_pointer("gaze", raw[0], raw[1], 25.0, 4.0)
                                     gaze_active = True
-                                    self.event_ready.emit(InteractionEvent("gaze", "gaze", "move_pointer", 0.82, {
-                                        "x": int(sx * (self.width - 1)), "y": int(sy * (self.height - 1))}))
+                                    if pointer_active:
+                                        self.event_ready.emit(InteractionEvent("gaze", "gaze", "move_pointer", 0.82, {
+                                            "x": int(sx * (self.width - 1)), "y": int(sy * (self.height - 1))}))
                         if self.head_enabled and not gaze_active:
                             if self.recenter_requested:
                                 self.head_origin = None
@@ -260,8 +272,9 @@ class VisionWorker(QThread):
                                 point = self._head_pointer(head_feat)
                                 if point is not None:
                                     sx, sy = self._smooth_pointer("head", point[0], point[1], 25.0, 4.0)
-                                    self.event_ready.emit(InteractionEvent("head", "head", "move_pointer", 0.75, {
-                                        "x": int(sx * (self.width - 1)), "y": int(sy * (self.height - 1))}))
+                                    if pointer_active:
+                                        self.event_ready.emit(InteractionEvent("head", "head", "move_pointer", 0.75, {
+                                            "x": int(sx * (self.width - 1)), "y": int(sy * (self.height - 1))}))
                     elif now - last_face_seen > 3.0 and now - last_face_warning > 10.0:
                         self.status.emit("No face detected - check camera framing and lighting")
                         last_face_warning = now
