@@ -54,8 +54,12 @@ class VoiceWorker(QThread):
         self.audio = queue.Queue()
 
     def stop(self):
+        """Ask the worker to stop without blocking the caller.
+
+        The stream is closed on the worker thread; callers keep the worker alive
+        until its ``finished`` signal arrives.
+        """
         self.stop_requested = True
-        self.wait(3000)
 
     def _phrase(self, value, confidence):
         text = value.lower().strip()

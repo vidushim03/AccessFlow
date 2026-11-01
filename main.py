@@ -4,6 +4,7 @@ import json
 import os
 import sys
 import time
+import warnings
 from pathlib import Path
 
 from PySide6.QtCore import Qt, QSettings, Signal, QObject, QTimer, QRect
@@ -67,6 +68,12 @@ class AccessFlowWindow(QMainWindow):
         self.engine = InteractionEngine(self.actions, on_pause=self._pause_workers)
         self.vision_worker = None
         self.voice_worker = None
+        # Workers keep tearing down MediaPipe/audio after a pause request, so they
+        # stay referenced here until their finished signal arrives.
+        self._retiring_workers = []
+        self._pending_start = False
+        self._pending_calibration = False
+        self._quitting = False
         self.running = False
         self.gaze_transform = None
         saved_transform = self.settings.value("gaze/transform_v3", "")
@@ -88,7 +95,8 @@ class AccessFlowWindow(QMainWindow):
         self._build_ui()
         self._build_tray()
         self._restore_settings()
-        QShortcut(QKeySequence("Esc"), self, activated=self._pause)
+        self.esc_shortcut = QShortcut(QKeySequence("Esc"), self)
+        self.esc_shortcut.activated.connect(self._pause)
 
     def _build_ui(self):
         root = QWidget()
@@ -175,7 +183,7 @@ class AccessFlowWindow(QMainWindow):
         pause.clicked.connect(self._pause)
         box.addWidget(pause, 0, Qt.AlignmentFlag.AlignLeft)
 
-        note = QLabel("Camera tracking combines gaze and hand input through one webcam owner. Voice recognition is local and needs an extracted Vosk model folder. Inputs start only when selected here.")
+        note = QLabel("Camera tracking combines gaze, head, and hand input through one webcam owner. Voice recognition is local and needs an extracted Vosk model folder. Inputs start only when selected here.")
         note.setObjectName("notice")
         note.setWordWrap(True)
         box.addWidget(note)
@@ -186,14 +194,20 @@ class AccessFlowWindow(QMainWindow):
         page, box = self._page("Input methods", "Select what AccessFlow should listen to when you start a session.")
         self.input_checks = {}
         definitions = [
-            ("gaze", "Eye gaze", "Moves the pointer from eye direction. First-run face model downloads from MediaPipe."),
-            ("gestures", "Hand gestures", "Point to move and pinch to click. Shares the camera worker with gaze."),
+            ("gaze", "Eye gaze", "Moves the pointer from eye direction. Selecting it turns Head tracking off. First-run face model downloads from MediaPipe."),
+            ("gestures", "Hand gestures", "Point to move and pinch to click. Shares the camera worker with gaze and head tracking."),
             ("voice", "Voice commands and dictation", "Offline Vosk recognition; audio is processed locally."),
+            ("head", "Head tracking", "Moves the pointer from head movement. Selecting it turns Eye gaze off; it learns your neutral head position when the session starts. Uses the same face model as eye gaze.")
         ]
         for key, title, detail in definitions:
             card = self._card(title, detail)
             check = QCheckBox("Enable")
+            check.toggled.connect(lambda checked, name=key: self._exclusive_camera_mode(name, checked))
             card.layout().addWidget(check)
+            if key == "head":
+                recenter = QPushButton("Recenter head tracking")
+                recenter.clicked.connect(self._recenter_head)
+                card.layout().addWidget(recenter)
             self.input_checks[key] = check
             box.addWidget(card)
 
@@ -213,13 +227,26 @@ class AccessFlowWindow(QMainWindow):
         box.addStretch()
         return page
 
+    def _exclusive_camera_mode(self, key, checked):
+        if not checked or key not in ("gaze", "head"):
+            return
+        other = "head" if key == "gaze" else "gaze"
+        self.input_checks[other].setChecked(False)
+
+    def _recenter_head(self):
+        if self.running and self.vision_worker and self.input_checks["head"].isChecked():
+            self.vision_worker.recenter_head()
+            self.status_label.setText("Head tracking recentered")
+        else:
+            self.status_label.setText("Start Head tracking first")
+
     def _calibration(self):
-        page, box = self._page("Gaze calibration", "Calibrate nine screen points before eye gaze can control the pointer.")
+        page, box = self._page("Gaze calibration", "Calibrate nine screen points before eye gaze can control the pointer. Keep your head still and repeat if pointer placement is inaccurate.")
         self.calibration_status = QLabel("Not calibrated")
         self.calibration_status.setObjectName("notice")
         self.calibration_status.setWordWrap(True)
         box.addWidget(self.calibration_status)
-        start = QPushButton("Start nine-point calibration")
+        start = QPushButton("Start calibration")
         start.setObjectName("primary")
         start.clicked.connect(self._begin_calibration)
         box.addWidget(start, 0, Qt.AlignmentFlag.AlignLeft)
@@ -230,6 +257,10 @@ class AccessFlowWindow(QMainWindow):
     def _begin_calibration(self):
         if self.running:
             self._pause()
+        if self._retiring_workers:
+            self._pending_calibration = True
+            self.calibration_status.setText("Waiting for previous inputs to stop…")
+            return
         if not self.input_checks["gaze"].isChecked():
             QMessageBox.information(self, "Select eye gaze", "Enable Eye gaze in Input methods, then start calibration.")
             return
@@ -243,7 +274,7 @@ class AccessFlowWindow(QMainWindow):
         self.calibration_overlay.showFullScreen()
         self.calibration_overlay.cancelled.connect(self._stop_calibration)
         self.calibration_overlay.installEventFilter(self)
-        self.vision_worker = VisionWorker(pointer_width, pointer_height, True, False)
+        self.vision_worker = VisionWorker(pointer_width, pointer_height, gaze_enabled=True, gestures_enabled=False)
         self.vision_worker.gaze_sample.connect(self._collect_gaze_sample)
         self.vision_worker.status.connect(self._calibration_status)
         self.vision_worker.start()
@@ -284,6 +315,10 @@ class AccessFlowWindow(QMainWindow):
                 raise ValueError(f"Calibration error too high ({error:.2f}). Improve lighting and try again.")
             self.gaze_transform = matrix.tolist()
             self.settings.setValue("gaze/transform_v3", json.dumps(self.gaze_transform))
+            # Reset pointer filters so the next session starts clean
+            if self.vision_worker:
+                self.vision_worker.pointer_filters["gaze"].reset()
+                self.vision_worker.pointer_filters["head"].reset()
             self.calibration_status.setText("Calibration saved! You can now start Eye gaze.")
         except Exception as exc:
             self.gaze_transform = None
@@ -303,8 +338,7 @@ class AccessFlowWindow(QMainWindow):
 
     def _stop_calibration(self):
         self.calibration_timer.stop()
-        if self.vision_worker and self.vision_worker.isRunning():
-            self.vision_worker.stop()
+        self._retire_worker(self.vision_worker)
         self.vision_worker = None
         if self.calibration_overlay:
             self.calibration_overlay.close()
@@ -366,7 +400,7 @@ class AccessFlowWindow(QMainWindow):
         toggle = QAction("Start / pause inputs", self)
         toggle.triggered.connect(self._toggle_running)
         exit_action = QAction("Exit", self)
-        exit_action.triggered.connect(QApplication.quit)
+        exit_action.triggered.connect(self._quit)
         menu.addAction(show)
         menu.addAction(toggle)
         menu.addSeparator()
@@ -397,9 +431,14 @@ class AccessFlowWindow(QMainWindow):
             self._start()
 
     def _start(self):
+        if self._retiring_workers:
+            self._pending_start = True
+            self.status_label.setText("Waiting for previous inputs to stop…")
+            return
         gaze = self.input_checks["gaze"].isChecked()
         gestures = self.input_checks["gestures"].isChecked()
         voice = self.input_checks["voice"].isChecked()
+        head = self.input_checks["head"].isChecked()
         model_path = Path(self.model_path.text().strip())
         if voice and not model_path.is_dir():
             QMessageBox.warning(self, "Vosk model required", "Select an extracted Vosk model folder before enabling voice input.")
@@ -415,6 +454,8 @@ class AccessFlowWindow(QMainWindow):
             sources.append("gestures")
         if voice:
             sources.append("voice")
+        if head:
+            sources.append("head")
         self.engine.start(sources)
         self.running = True
         self.start_button.setText("Pause inputs")
@@ -422,9 +463,11 @@ class AccessFlowWindow(QMainWindow):
         self.session_card.layout().itemAt(0).widget().setText("Session active")
         self.session_card.layout().itemAt(1).widget().setText(", ".join(sources) if sources else "No input methods selected")
 
-        if gaze or gestures:
+        if gaze or gestures or head:
             pointer_width, pointer_height = self.actions.screen_size()
-            self.vision_worker = VisionWorker(pointer_width, pointer_height, gaze, gestures, self.gaze_transform)
+            self.vision_worker = VisionWorker(
+                pointer_width, pointer_height, gaze, gestures,
+                gaze_transform=self.gaze_transform, head_enabled=head)
             self.vision_worker.event_ready.connect(self._on_event)
             self.vision_worker.status.connect(self.status_label.setText)
             self.vision_worker.start()
@@ -440,30 +483,89 @@ class AccessFlowWindow(QMainWindow):
             return
         self.engine.dispatch(event)
 
+    def _retire_worker(self, worker):
+        """Stop a worker without blocking the GUI thread."""
+        if worker is None:
+            return
+        # Drop UI callbacks first so late status/event signals cannot overwrite
+        # the Paused state while the worker tears down.
+        with warnings.catch_warnings():
+            # PySide warns when disconnecting a signal that has no listeners.
+            warnings.simplefilter("ignore", RuntimeWarning)
+            for name in ("status", "event_ready", "gaze_sample"):
+                signal = getattr(worker, name, None)
+                if signal is not None:
+                    try:
+                        signal.disconnect()
+                    except (RuntimeError, TypeError):
+                        pass
+        worker.stop()
+        worker.finished.connect(self._on_worker_finished)
+        if worker.isRunning():
+            self._retiring_workers.append(worker)
+        else:
+            worker.deleteLater()
+
+    def _on_worker_finished(self):
+        worker = self.sender()
+        if worker in self._retiring_workers:
+            self._retiring_workers.remove(worker)
+        if worker is not None:
+            worker.deleteLater()
+        if self._retiring_workers:
+            return
+        if self._quitting:
+            self._quitting = False
+            QApplication.quit()
+        elif self._pending_start:
+            self._pending_start = False
+            QTimer.singleShot(0, self._start)
+        elif self._pending_calibration:
+            self._pending_calibration = False
+            QTimer.singleShot(0, self._begin_calibration)
+
     def _pause_workers(self):
-        self._stop_calibration() if self.calibration_timer.isActive() else None
-        for worker in (self.vision_worker, self.voice_worker):
-            if worker and worker.isRunning():
-                worker.stop()
+        if self.calibration_timer.isActive():
+            self._stop_calibration()
+        self._retire_worker(self.vision_worker)
+        self._retire_worker(self.voice_worker)
         self.vision_worker = None
         self.voice_worker = None
 
     def _pause(self):
-        self.engine.pause()
+        # Update visible state first: stopping workers must never delay feedback.
+        self._pending_start = False
+        self._pending_calibration = False
         self.running = False
         self.start_button.setText("Start selected inputs")
         self.status_label.setText("Paused")
         self.session_card.layout().itemAt(0).widget().setText("Session paused")
         self.session_card.layout().itemAt(1).widget().setText("Camera and microphone are off.")
+        self.engine.pause()
+
+    def _quit(self):
+        self._pause()
+        if self._retiring_workers:
+            self._quitting = True
+            self.hide()
+            QTimer.singleShot(8000, self._force_quit)
+        else:
+            QApplication.quit()
+
+    def _force_quit(self):
+        if not self._quitting:
+            return
+        self._quitting = False
+        QApplication.quit()
+
     def closeEvent(self, event):
         if self.tray.isVisible():
             self._pause()
             self.hide()
             event.ignore()
         else:
-            self._pause()
+            self._quit()
             event.accept()
-            QApplication.quit()
 
 
 def main():
