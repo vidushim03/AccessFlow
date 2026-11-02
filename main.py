@@ -292,7 +292,9 @@ class AccessFlowWindow(QMainWindow):
         self._retiring_workers = []
         self._pending_start = False
         self._pending_calibration = False
+        self._pending_preview = None
         self._quitting = False
+        self._calibration_in_flight = False
         self.running = False
         self.calibration_notice = ""
         self.safety_warning = ""
@@ -858,10 +860,6 @@ class AccessFlowWindow(QMainWindow):
         if voice and not model_path.is_dir():
             QMessageBox.warning(self, "Vosk model required", "Select an extracted Vosk model folder before enabling voice input.")
             return
-        if gaze and not self.gaze_transform:
-            QMessageBox.warning(self, "Calibrate gaze first", "Open Calibration and complete the nine-point calibration before starting eye gaze.")
-            self._navigate(PAGE_CALIBRATION)
-            return
         sources = []
         if gaze:
             sources.append("gaze")
@@ -871,6 +869,9 @@ class AccessFlowWindow(QMainWindow):
             sources.append("voice")
         if head:
             sources.append("head")
+        # Each input starts independently. A missing eye calibration only
+        # blocks gaze, not hand/head.
+        self._active = True
         self.engine.start(sources)
         self.running = True
         self.start_button.setText("Pause inputs")
@@ -883,6 +884,15 @@ class AccessFlowWindow(QMainWindow):
             self.vision_worker = VisionWorker(
                 pointer_width, pointer_height, gaze, gestures,
                 gaze_transform=self.gaze_transform, head_enabled=head)
+            self.vision_worker.event_ready.connect(self._on_event)
+            self.vision_worker.status.connect(self.status_label.setText)
+            self.vision_worker.start()
+        if voice:
+            self.voice_worker = VoiceWorker(str(model_path))
+            self.voice_worker.event_ready.connect(self._on_event)
+            self.voice_worker.status.connect(self.status_label.setText)
+            self.voice_worker.start()
+
             self.vision_worker.event_ready.connect(self._on_event)
             self.vision_worker.status.connect(self.status_label.setText)
             self.vision_worker.start()
@@ -974,6 +984,19 @@ class AccessFlowWindow(QMainWindow):
         self.session_card.layout().itemAt(0).widget().setText("Session paused")
         self.session_card.layout().itemAt(1).widget().setText("Camera and microphone are off.")
         self.engine.pause()
+        self._active = False
+
+    def _active_input(self, key):
+        """Return True when an input method is enabled for the session."""
+        if key == "gaze":
+            return self.input_checks["gaze"].isChecked()
+        if key == "head":
+            return self.input_checks["head"].isChecked()
+        if key == "gestures":
+            return self.input_checks["gestures"].isChecked()
+        if key == "voice":
+            return self.input_checks["voice"].isChecked()
+        return False
 
     def _hook_failed(self, message):
         """Warn when a global hook could not be installed.
