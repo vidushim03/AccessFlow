@@ -8,12 +8,14 @@ from pathlib import Path
 
 import cv2
 import mediapipe as mp
-import numpy as np
 from PySide6.QtCore import QThread, Signal
 from mediapipe.tasks.python.core.base_options import BaseOptions
 from mediapipe.tasks.python.vision import FaceLandmarker, FaceLandmarkerOptions, HandLandmarker, HandLandmarkerOptions, RunningMode
 from accessflow.core.events import InteractionEvent
 from accessflow.inputs.filters import OneEuroFilter2D
+from accessflow.inputs.mapping import (
+    RelativePointer, apply_gaze_mapping, valid_gaze_matrix,
+)
 
 if sys.platform == "win32":
     from ctypes import wintypes
@@ -35,10 +37,13 @@ HAND_URL = "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand
 HEAD_X_GAIN = 1.8
 HEAD_Y_GAIN = 2.4
 # Average the first few samples so a single noisy first frame cannot become the
-# permanent neutral pose.
+# permanent neutral pose. The window is restarted whenever the samples move too
+# far apart, so a user who is still settling into place never freezes a moving
+# pose as "neutral".
 HEAD_NEUTRAL_SAMPLES = 8
+HEAD_NEUTRAL_SPREAD = 0.008
 # A single frame that claims the pointer should teleport across more than this
-# fraction of the screen is a landmark glitch, not real motion.
+# fraction of the screen diagonal is a landmark glitch, not real motion.
 POINTER_JUMP_LIMIT = 0.35
 # EMA alpha for head tracking, matching vision-access-hci's 0.18 per frame.
 # The reference uses a plain EMA on absolute position with no deadzone and no
@@ -46,46 +51,92 @@ POINTER_JUMP_LIMIT = 0.35
 # dragging the pointer.
 HEAD_EMA_ALPHA = 0.18
 
+# Standard MediaPipe hand topology, used by the tracking preview to draw the
+# skeleton. Only the preview needs it; detection itself only returns points.
+HAND_CONNECTIONS = (
+    (0, 1), (1, 2), (2, 3), (3, 4),
+    (0, 5), (5, 6), (6, 7), (7, 8),
+    (5, 9), (9, 10), (10, 11), (11, 12),
+    (9, 13), (13, 14), (14, 15), (15, 16),
+    (13, 17), (17, 18), (18, 19), (19, 20),
+    (0, 17),
+)
+# Face points worth drawing in the preview: nose tip, both eye corners and
+# both iris centres. Drawing all 478 landmarks is just noise at this size.
+PREVIEW_FACE_POINTS = (1, 33, 133, 159, 145, 362, 263, 386, 374, 468, 473)
+# The preview is a diagnostic view, not the control path, so it can afford to
+# be a little behind the live camera.
+PREVIEW_INTERVAL = 0.05
+
 
 class HeadTracker:
     """Head-pointer controller mirroring vision-access-hci.
 
     The raw nose-tip landmark is compared with a learned neutral pose and
     scaled by the configured gains to produce an absolute target position,
-    which is then passed through a plain EMA. There is no offset anchoring,
-    no per-frame step clamp and no deadzone: the EMA alone is the low-pass,
-    and it settles to the anchor when the head is still, so a still user
-    produces no pointer drift.
+    which is then passed through a plain EMA. There is no per-frame step clamp
+    and no deadzone: the EMA alone is the low-pass, and it settles to the
+    anchor when the head is still, so a still user produces no pointer drift.
 
-    The tracker can be re-anchored to an arbitrary pointer position (used
-    after a touchpad takeover or input-method switch) by resetting the
-    smoothed value and re-deriving the neutral pose from the current feature.
+    The neutral pose is learned from a short window of stable samples while
+    the pointer is held at the requested anchor, so a bad first detection or
+    the user sitting down cannot permanently bias the cursor. Afterwards the
+    tracker can be re-anchored to an arbitrary pointer position (used after a
+    touchpad takeover or input-method switch) by re-deriving the neutral pose
+    from the current feature.
     """
 
     def __init__(self, alpha=HEAD_EMA_ALPHA, gain_x=HEAD_X_GAIN,
-                 gain_y=HEAD_Y_GAIN, neutral_samples=HEAD_NEUTRAL_SAMPLES):
+                 gain_y=HEAD_Y_GAIN, neutral_samples=HEAD_NEUTRAL_SAMPLES,
+                 neutral_spread=HEAD_NEUTRAL_SPREAD):
         self.alpha = alpha
         self.gain_x = gain_x
         self.gain_y = gain_y
+        self.neutral_samples = neutral_samples
+        self.neutral_spread = neutral_spread
         self.origin = None
         self._samples = []
         self.smoothed = None
+        self.activated = False
 
     def reset(self):
-        """Forget the learned neutral pose and smoothed position."""
+        """Forget the neutral pose and start learning it again."""
         self.origin = None
         self._samples = []
         self.smoothed = None
+        self.activated = False
 
-    def _learn_origin(self, feature):
+    def _stable_origin(self, feature):
+        """Return a stable neutral feature, or None while still gathering.
+
+        A single bad frame must not become the neutral pose, so the origin is
+        the mean of several samples. A window whose samples are spread further
+        apart than ``neutral_spread`` is discarded and restarted: that is the
+        user still moving into position, not a neutral pose.
+        """
         self._samples.append(feature)
-        if len(self._samples) < HEAD_NEUTRAL_SAMPLES:
-            return False
+        if len(self._samples) < self.neutral_samples:
+            return None
         count = len(self._samples)
-        self.origin = (sum(s[0] for s in self._samples) / count,
-                       sum(s[1] for s in self._samples) / count)
+        median_x = sorted(s[0] for s in self._samples)[count // 2]
+        median_y = sorted(s[1] for s in self._samples)[count // 2]
+        spread = max(math.hypot(s[0] - median_x, s[1] - median_y)
+                     for s in self._samples)
+        if spread > self.neutral_spread:
+            self._samples = [feature]
+            return None
+        origin = (sum(s[0] for s in self._samples) / count,
+                  sum(s[1] for s in self._samples) / count)
         self._samples = []
-        return True
+        return origin
+
+    def _anchor_to(self, feature, anchor):
+        """Derive the neutral pose that puts ``feature`` at ``anchor``."""
+        self.origin = (feature[0] - (anchor[0] - 0.5) / self.gain_x,
+                       feature[1] - (anchor[1] - 0.5) / self.gain_y)
+        self.smoothed = (max(0.0, min(1.0, anchor[0])),
+                         max(0.0, min(1.0, anchor[1])))
+        self._samples = []
 
     def update(self, feature, anchor=None):
         """Map a nose-tip feature to a smoothed pointer position.
@@ -93,26 +144,37 @@ class HeadTracker:
         Args:
             feature: (x, y) raw nose-tip landmark in normalised image space.
             anchor: Optional (x, y) normalised screen position to anchor the
-                tracker to when it has no smoothed state yet. Used after a
-                touchpad takeover, recenter, or first activation so the pointer
-                does not jump.
+                tracker to. On first activation the neutral pose is learned
+                while the pointer is held at this position; afterwards an
+                anchor means "resume from here" (a recenter or a switch to
+                head control) and is applied immediately.
 
         Returns:
-            (x, y) normalised screen position, or None while learning origin.
+            (x, y) normalised screen position, or None while learning the
+            neutral pose.
         """
-        if self.smoothed is None and anchor is not None:
-            # Anchor to an external pointer position: derive the neutral pose
-            # so the current head position maps to the anchor, then start the
-            # EMA there. This is what "Recenter head tracking" and the
-            # touchpad takeover do — the pointer stays where it is.
-            self.origin = (feature[0] - (anchor[0] - 0.5) / self.gain_x,
-                           feature[1] - (anchor[1] - 0.5) / self.gain_y)
-            self.smoothed = (max(0.0, min(1.0, anchor[0])),
-                             max(0.0, min(1.0, anchor[1])))
+        if anchor is not None:
+            if not self.activated:
+                # Hold the pointer still until the neutral window is stable.
+                origin = self._stable_origin(feature)
+                if origin is None:
+                    return None
+                self.origin = (
+                    origin[0] - (anchor[0] - 0.5) / self.gain_x,
+                    origin[1] - (anchor[1] - 0.5) / self.gain_y)
+                self.smoothed = (max(0.0, min(1.0, anchor[0])),
+                                 max(0.0, min(1.0, anchor[1])))
+                self.activated = True
+                return self.smoothed
+            # Takeover/recenter: adopt the current pose as the new neutral.
+            self._anchor_to(feature, anchor)
             return self.smoothed
         if self.origin is None:
-            if not self._learn_origin(feature):
+            origin = self._stable_origin(feature)
+            if origin is None:
                 return None
+            self.origin = origin
+            self.activated = True
         dx = (feature[0] - self.origin[0]) * self.gain_x
         dy = (feature[1] - self.origin[1]) * self.gain_y
         target = (max(0.0, min(1.0, 0.5 + dx)),
@@ -142,11 +204,17 @@ class VisionWorker(QThread):
     event_ready = Signal(object)
     gaze_sample = Signal(object)
     status = Signal(str)
+    # Diagnostic stream for the tracking-preview page. Emitted only when the
+    # worker was constructed with ``preview`` set; the payload is a plain dict
+    # of a mirrored RGB frame plus landmarks and the mapped cursor.
+    preview_ready = Signal(object)
 
-    def __init__(self, width, height, gaze_enabled, gestures_enabled, gaze_transform=None, head_enabled=False):
+    def __init__(self, width, height, gaze_enabled, gestures_enabled,
+                 gaze_transform=None, head_enabled=False, preview=None):
         super().__init__()
         self.width, self.height = width, height
         self.gaze_enabled, self.gestures_enabled, self.head_enabled = gaze_enabled, gestures_enabled, head_enabled
+        self.preview = preview
         self.stop_requested = False
         self.previous_pinch = False
         self.last_pinch_click = 0.0
@@ -159,16 +227,30 @@ class VisionWorker(QThread):
         self.pointer_offset = {}
         self.pointer_last = None
         self.head_tracker = HeadTracker()
+        # Hands use a relative trackpad mapping, never an absolute one. The
+        # dead zone with its slow leak does the tremor suppression; a
+        # pre-filter would lag behind the finger and swallow slow movement.
+        self.hand_pointer = RelativePointer(width, height)
         self.recenter_requested = False
         self.pointer_filters = {
-            # Fast enough to follow the hand, smooth enough to hide landmark jitter.
-            "gestures": OneEuroFilter2D(1.2, 0.02),
             # Eye gaze is inherently noisy and calibrated; keep it slow.
             "gaze": OneEuroFilter2D(0.15, 0.005),
-            # Comparable to the reference EMA (0.18 at 60 FPS) plus speed adaptation.
-            "head": OneEuroFilter2D(0.9, 0.03),
         }
-        self.gaze_transform = np.asarray(gaze_transform, dtype=float) if gaze_transform is not None else None
+        # Head tracking smooths itself inside HeadTracker, so it has no entry
+        # here; a filter left unused would only suggest it still applied.
+        self._screen_diagonal = math.hypot(width, height)
+        self.gaze_transform = self._checked_transform(gaze_transform)
+
+    @staticmethod
+    def _checked_transform(gaze_transform):
+        """Accept only a finite affine or quadratic mapping.
+
+        A malformed mapping would raise on every frame and stop the whole
+        camera session, which also takes head and hand tracking down with it.
+        """
+        if gaze_transform is None:
+            return None
+        return valid_gaze_matrix(gaze_transform)
 
     def _screen_pointer(self):
         """Current real pointer position in normalised screen coordinates."""
@@ -185,7 +267,9 @@ class VisionWorker(QThread):
 
     def _forget_source(self, source):
         """Discard smoothed state for one source so it restarts cleanly."""
-        self.pointer_filters[source].reset()
+        pointer_filter = self.pointer_filters.get(source)
+        if pointer_filter is not None:
+            pointer_filter.reset()
         self.pointer_output.pop(source, None)
         self.pointer_offset.pop(source, None)
         if self.pointer_source == source:
@@ -196,33 +280,34 @@ class VisionWorker(QThread):
         self.pointer_source = None
         self.pointer_output.clear()
         self.pointer_offset.clear()
+        # Resume the relative hand pointer where the real cursor is, so the
+        # first hand movement after a touchpad takeover continues from there.
+        if self.preview:
+            self.hand_pointer.reset((0.5, 0.5))
+        else:
+            self.hand_pointer.reset(self._screen_pointer() or self.pointer_last)
         # The head tracker holds its own smoothed state; drop it so the next
         # head frame re-anchors to wherever the pointer now is.
         self.head_tracker.smoothed = None
 
-    def _smooth_pointer(self, source, x, y, deadzone_px, absolute=False):
-        """Filter one pointer sample and return the screen position to use.
+    def _smooth_pointer(self, source, x, y, deadzone_px, absolute=True):
+        """Filter one absolute (calibrated) pointer sample.
 
-        Head and hand control are relative to where the pointer already is: on
-        first use, after an input-method switch, or after a touchpad takeover,
-        the pointer is anchored rather than jumped. Gaze is calibrated to
-        absolute screen coordinates, so it is never anchored.
+        Only gaze uses this path now; hands are handled by ``RelativePointer``
+        and head by ``HeadTracker``. Gaze is calibrated to absolute screen
+        coordinates, so it is never anchored to the previous pointer.
         """
         now = time.monotonic()
-        switching = self.pointer_source != source
-        if switching:
+        if self.pointer_source != source:
             # Never let a filter carry motion across an input-method change.
             self.pointer_filters[source].reset()
             self.pointer_output.pop(source, None)
         filtered = self.pointer_filters[source].update((x, y), now)
         previous = self.pointer_output.get(source)
         if previous is None:
-            if absolute:
-                current = (max(0.0, min(1.0, filtered[0])),
-                           max(0.0, min(1.0, filtered[1])))
-            else:
-                current = self._screen_pointer() or self.pointer_last or (0.5, 0.5)
-            self.pointer_offset[source] = (current[0] - filtered[0], current[1] - filtered[1])
+            current = (max(0.0, min(1.0, filtered[0])),
+                       max(0.0, min(1.0, filtered[1])))
+            self.pointer_offset[source] = (0.0, 0.0)
             self.pointer_output[source] = current
             self.pointer_source = source
             self.pointer_last = current
@@ -231,13 +316,11 @@ class VisionWorker(QThread):
         target_y = filtered[1] + self.pointer_offset[source][1]
         dx = (target_x - previous[0]) * self.width
         dy = (target_y - previous[1]) * self.height
-        distance = math.hypot(dx, dy)
-        if distance < deadzone_px:
+        if math.hypot(dx, dy) < deadzone_px:
             return previous
-        if distance > self.width * POINTER_JUMP_LIMIT:
+        if math.hypot(dx, dy) > self._screen_diagonal * POINTER_JUMP_LIMIT:
             # A bad landmark frame can claim a huge jump. Keep the pointer still
-            # and rebase the source on the new sample so normal movement can
-            # continue on the next frame.
+            # and rebase on the new sample so normal movement can continue.
             self.pointer_offset[source] = (previous[0] - filtered[0],
                                            previous[1] - filtered[1])
             return previous
@@ -309,6 +392,50 @@ class VisionWorker(QThread):
         """
         self.stop_requested = True
 
+    def _emit_preview(self, rgb, points, cursor, label, calibrated=True):
+        """Publish one diagnostic frame to the tracking-preview page."""
+        if not self.preview:
+            return
+        self.preview_ready.emit({
+            "mode": self.preview,
+            "frame": rgb,
+            "points": points or [],
+            "cursor": cursor,
+            "label": label,
+            "calibrated": calibrated,
+        })
+
+    def _hand_tracking(self, points, now, pointer_active):
+        """Map one detected hand and update the relative pointer.
+
+        Returns ``(cursor, label)`` for the preview and the live pointer path.
+        """
+        index_tip, thumb_tip = points[8], points[4]
+        cursor = self.hand_pointer.update(index_tip.x, index_tip.y)
+
+        palm_size = math.hypot(points[0].x - points[9].x, points[0].y - points[9].y)
+        pinch_ratio = math.hypot(index_tip.x - thumb_tip.x,
+                                 index_tip.y - thumb_tip.y) / max(palm_size, 0.001)
+        clicked = False
+        if not self.previous_pinch and pinch_ratio <= 0.32:
+            if self.pinch_started_at is None:
+                self.pinch_started_at = now
+            elif now - self.pinch_started_at >= 0.08 and now - self.last_pinch_click >= 0.70:
+                self.previous_pinch = True
+                self.last_pinch_click = now
+                clicked = True
+        elif self.previous_pinch and pinch_ratio >= 0.48:
+            self.previous_pinch = False
+            self.pinch_started_at = None
+        elif not self.previous_pinch and pinch_ratio > 0.32:
+            self.pinch_started_at = None
+
+        label = "Pinch detected - click" if self.previous_pinch else "Move your index finger to steer"
+        if clicked and pointer_active and not self.preview:
+            self.event_ready.emit(InteractionEvent(
+                "gestures", "pinch", "click", 0.90, {"button": "left"}))
+        return cursor, label
+
     def run(self):
         capture = face = hand = None
         reported_stop = False
@@ -337,6 +464,7 @@ class VisionWorker(QThread):
             last_face_warning = 0.0
             face_seen = False
             last_brightness_check = 0.0
+            last_preview = 0.0
             dark_checks = 0
             dark_warned = False
             failed_reads = 0
@@ -373,33 +501,39 @@ class VisionWorker(QThread):
                     self.pointer_was_suspended = False
                     self._reset_pointer_state()
                 hand_seen = False
+                preview_points = []
+                preview_cursor = None
+                preview_label = ""
+                preview_calibrated = True
                 if hand:
                     hands = hand.detect_for_video(image, timestamp).hand_landmarks
                     if hands:
                         hand_seen = True
                         self.last_hand_seen = time.monotonic()
                         points = hands[0]
-                        index_tip, thumb_tip = points[8], points[4]
+                        preview_points = [(p.x, p.y) for p in points]
                         if pointer_active:
-                            sx, sy = self._smooth_pointer("gestures", index_tip.x, index_tip.y, 5.0)
-                            self.event_ready.emit(InteractionEvent("gestures", "pointer", "move_pointer", 0.86, {
-                                "x": int(sx * (self.width - 1)), "y": int(sy * (self.height - 1))}))
-                        palm_size = math.hypot(points[0].x - points[9].x, points[0].y - points[9].y)
-                        pinch_ratio = math.hypot(index_tip.x - thumb_tip.x, index_tip.y - thumb_tip.y) / max(palm_size, 0.001)
-                        now = time.monotonic()
-                        if not self.previous_pinch and pinch_ratio <= 0.32:
-                            if self.pinch_started_at is None:
-                                self.pinch_started_at = now
-                            elif now - self.pinch_started_at >= 0.08 and now - self.last_pinch_click >= 0.70:
-                                if pointer_active:
-                                    self.event_ready.emit(InteractionEvent("gestures", "pinch", "click", 0.90, {"button": "left"}))
-                                self.previous_pinch = True
-                                self.last_pinch_click = now
-                        elif self.previous_pinch and pinch_ratio >= 0.48:
-                            self.previous_pinch = False
-                            self.pinch_started_at = None
-                        elif not self.previous_pinch and pinch_ratio > 0.32:
-                            self.pinch_started_at = None
+                            cursor, preview_label = self._hand_tracking(
+                                points, now, pointer_active)
+                            preview_cursor = cursor
+                            if not self.preview:
+                                self.pointer_source = "gestures"
+                                self.pointer_last = cursor
+                                self.event_ready.emit(InteractionEvent(
+                                    "gestures", "pointer", "move_pointer", 0.86, {
+                                        "x": int(cursor[0] * (self.width - 1)),
+                                        "y": int(cursor[1] * (self.height - 1))}))
+                        else:
+                            preview_label = "Pointer handed to touchpad"
+                    else:
+                        # The hand left the frame: freeze the cursor and
+                        # re-anchor on the next detection. This is what stops
+                        # the pointer running off when the hand comes back.
+                        self.hand_pointer.on_hand_lost()
+                        self.previous_pinch = False
+                        self.pinch_started_at = None
+                        if self.preview == "hand":
+                            preview_label = "Show your hand to the camera"
                 # A visible hand owns the camera interaction for this frame; this avoids gaze/gesture cursor contention.
                 if face and not hand_seen and (not self.gestures_enabled or time.monotonic() - self.last_hand_seen > 0.5):
                     faces = face.detect_for_video(image, timestamp).face_landmarks
@@ -417,14 +551,30 @@ class VisionWorker(QThread):
                                 rx, ry = gaze_feat
                                 self.gaze_sample.emit((rx, ry))
                                 if self.gaze_transform is not None:
-                                    raw = np.array([rx, ry, 1.0]) @ self.gaze_transform
-                                    raw = (max(0.0, min(1.0, float(raw[0]))), max(0.0, min(1.0, float(raw[1]))))
+                                    raw = apply_gaze_mapping(self.gaze_transform, rx, ry)
                                     gaze_active = True
-                                    if pointer_active:
+                                    if pointer_active and not self.preview:
                                         sx, sy = self._smooth_pointer(
                                             "gaze", raw[0], raw[1], 6.0, absolute=True)
+                                        self.pointer_source = "gaze"
+                                        self.pointer_last = (sx, sy)
                                         self.event_ready.emit(InteractionEvent("gaze", "gaze", "move_pointer", 0.82, {
                                             "x": int(sx * (self.width - 1)), "y": int(sy * (self.height - 1))}))
+                                    preview_cursor = raw
+                                elif self.preview:
+                                    # Uncalibrated preview still shows the raw
+                                    # iris position so the user can see that
+                                    # the eyes are being tracked.
+                                    preview_cursor = (max(0.0, min(1.0, rx)),
+                                                      max(0.0, min(1.0, ry)))
+                                    preview_calibrated = False
+                                if self.preview:
+                                    preview_points = [
+                                        (landmarks[i].x, landmarks[i].y)
+                                        for i in PREVIEW_FACE_POINTS]
+                                    preview_label = ("Gaze mapped to the screen"
+                                                     if self.gaze_transform is not None
+                                                     else "Not calibrated - run Calibration")
                         if self.head_enabled and not gaze_active:
                             if self.recenter_requested:
                                 self.head_tracker.reset()
@@ -434,16 +584,42 @@ class VisionWorker(QThread):
                             if head_feat is not None:
                                 anchor = None
                                 if self.head_tracker.smoothed is None:
-                                    anchor = self._screen_pointer() or self.pointer_last or (0.5, 0.5)
+                                    if self.preview:
+                                        anchor = (0.5, 0.5)
+                                    else:
+                                        anchor = self._screen_pointer() or self.pointer_last or (0.5, 0.5)
+                                elif (not self.preview
+                                      and self.pointer_source not in (None, "head")):
+                                    # Another input method moved the pointer since
+                                    # the last head frame: resume from there
+                                    # instead of jumping back to the old pose.
+                                    anchor = (self._screen_pointer()
+                                              or self.pointer_last or (0.5, 0.5))
                                 point = self._head_pointer(head_feat, anchor=anchor)
-                                if point is not None and pointer_active:
-                                    self.pointer_source = "head"
-                                    self.pointer_last = point
-                                    self.event_ready.emit(InteractionEvent("head", "head", "move_pointer", 0.75, {
-                                        "x": int(point[0] * (self.width - 1)), "y": int(point[1] * (self.height - 1))}))
+                                if self.preview:
+                                    preview_points = [
+                                        (landmarks[i].x, landmarks[i].y)
+                                        for i in PREVIEW_FACE_POINTS]
+                                if point is not None:
+                                    preview_cursor = point
+                                    if self.preview:
+                                        preview_label = "Move your head to steer"
+                                    elif pointer_active:
+                                        self.pointer_source = "head"
+                                        self.pointer_last = point
+                                        self.event_ready.emit(InteractionEvent("head", "head", "move_pointer", 0.75, {
+                                            "x": int(point[0] * (self.width - 1)), "y": int(point[1] * (self.height - 1))}))
+                                elif self.preview:
+                                    preview_label = "Hold still - learning your neutral position"
                     elif now - last_face_seen > 3.0 and now - last_face_warning > 10.0:
                         self.status.emit("No face detected - check camera framing and lighting")
                         last_face_warning = now
+                    elif self.preview and self.preview != "hand":
+                        preview_label = "Show your face to the camera"
+                if self.preview and now - last_preview >= PREVIEW_INTERVAL:
+                    last_preview = now
+                    self._emit_preview(rgb, preview_points, preview_cursor,
+                                       preview_label, preview_calibrated)
         except Exception as exc:
             self.status.emit(f"Camera stopped: {exc}")
             reported_stop = True

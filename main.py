@@ -5,10 +5,15 @@ import os
 import sys
 import time
 import warnings
+from collections import deque
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QSettings, Signal, QObject, QTimer, QRect
-from PySide6.QtGui import QAction, QKeySequence, QShortcut, QColor, QPainter
+import numpy as np
+
+from PySide6.QtCore import Qt, QSettings, Signal, QObject, QTimer, QRect, QSize
+from PySide6.QtGui import (
+    QAction, QColor, QFont, QImage, QKeySequence, QPainter, QPen, QShortcut,
+)
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QFileDialog, QFrame, QHBoxLayout, QLabel,
     QLineEdit, QMainWindow, QMenu, QMessageBox, QPushButton, QSlider,
@@ -17,11 +22,53 @@ from PySide6.QtWidgets import (
 
 from accessflow.core.engine import InteractionEngine
 from accessflow.system.hotkey import GlobalEscapeListener, GlobalPointerActivity
-from accessflow.system.actions import WindowsActions
-from accessflow.inputs.vision import VisionWorker
+from accessflow.system.actions import ActionExecutor, WindowsActions
+from accessflow.inputs.mapping import (
+    GAZE_MODEL_QUADRATIC, fit_gaze_mapping, valid_gaze_matrix,
+)
+from accessflow.inputs.vision import (
+    HAND_CONNECTIONS, PREVIEW_FACE_POINTS, VisionWorker,
+)
 from accessflow.inputs.voice import VoiceModelDownloadWorker, VoiceWorker
 
 APP_NAME = "AccessFlow"
+
+# Gaze calibration is accepted only once the eye feature has settled at each
+# target. 0.10 is the tolerance for the iris-in-eye feature (roughly 4-5 px of
+# iris jitter at 640x480). A still eye still produces microsaccadic and
+# landmark jitter, and corner targets rotate the eye so the iris sits near a
+# corner - sometimes partly under the lid - so the threshold must be loose
+# enough to accept genuine stillness while still rejecting a user whose eye is
+# actively moving between targets (which moves the feature by ~0.2+).
+CALIBRATION_STABLE_STD = 0.10
+CALIBRATION_MIN_SAMPLES = 10
+# Frames right after a target appears are transition frames: the eye needs time
+# to saccade to the new dot and settle, and on the first dot the user needs
+# time to locate it. 0.5 s keeps transition/saccade samples out of the stability
+# window without making each point feel sluggish.
+CALIBRATION_SAMPLE_GRACE = 0.5
+CALIBRATION_POINT_TIMEOUT = 8.0
+# Mean fit error as a fraction of the screen. 0.08 is about 150 px at 1920 wide;
+# anything looser accepts a mapping that cannot reach the edges accurately.
+CALIBRATION_MAX_ERROR = 0.08
+GAZE_FEATURE = "iris_in_eye_v1"
+CALIBRATION_KEY = "gaze/calibration"
+
+
+def _valid_gaze_matrix(value):
+    """Return a usable affine or quadratic mapping as a list, or None."""
+    array = valid_gaze_matrix(value)
+    return None if array is None else array.tolist()
+
+
+# The page order is shared by the sidebar buttons and programmatic
+# navigation, so a new page cannot silently shift "go to Calibration".
+PAGE_DASHBOARD = 0
+PAGE_INPUTS = 1
+PAGE_CALIBRATION = 2
+PAGE_PREVIEW = 3
+PAGE_ACCESSIBILITY = 4
+PAGE_ABOUT = 5
 
 
 class CalibrationOverlay(QWidget):
@@ -56,6 +103,172 @@ class CalibrationOverlay(QWidget):
         painter.setBrush(QColor("#ff5252"))
         painter.drawEllipse(int(x * self.width()) - 14, int(y * self.height()) - 14, 28, 28)
 
+class TrackingPreviewWidget(QWidget):
+    """Live camera + landmark + mapped-cursor display for one input method.
+
+    The left side is the mirrored camera feed with the detected landmarks.
+    The right side is a miniature screen showing exactly where the mapping
+    would put the pointer, so the user can see the mapping instead of
+    guessing from a cursor that jumps around on the real desktop.
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._payload = None
+        self.setMinimumSize(560, 360)
+        self.setObjectName("trackingPreview")
+
+    def sizeHint(self):
+        return QSize(760, 460)
+
+    def clear(self):
+        self._payload = None
+        self.update()
+
+    def set_payload(self, payload):
+        # Taking a deep copy of the frame means the camera thread can reuse
+        # its buffer immediately; painting happens later on the GUI thread.
+        frame = payload.get("frame")
+        image = None
+        if frame is not None and getattr(frame, "ndim", 0) == 3:
+            height, width = frame.shape[:2]
+            image = QImage(frame.data, width, height, frame.strides[0],
+                           QImage.Format.Format_RGB888).copy()
+        payload = dict(payload)
+        payload["image"] = image
+        payload.pop("frame", None)
+        self._payload = payload
+        self.update()
+
+    def _video_rect(self):
+        margin = 14
+        available_w = self.width() - 2 * margin
+        available_h = self.height() - 2 * margin
+        video_w = int(available_w * 0.62)
+        video_h = min(available_h, int(video_w * 3 / 4))
+        return QRect(margin, margin, video_w, video_h)
+
+    def _screen_rect(self):
+        margin = 14
+        video = self._video_rect()
+        left = video.right() + margin
+        width = self.width() - left - margin
+        height = self.height() - 2 * margin
+        return QRect(left, margin, max(120, width), height)
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        painter.fillRect(self.rect(), QColor("#0b1624"))
+
+        video = self._video_rect()
+        screen = self._screen_rect()
+        self._paint_screen(painter, screen)
+        self._paint_video(painter, video)
+
+        payload = self._payload
+        if payload is None:
+            painter.setPen(QColor("#8fa8bf"))
+            painter.drawText(video, Qt.AlignmentFlag.AlignCenter,
+                             "Choose Hand, Eye, or Head above to start the preview.")
+            return
+        label = payload.get("label") or ""
+        if label:
+            painter.setPen(QColor("#dbeafe"))
+            font = QFont(self.font())
+            font.setPointSize(10)
+            painter.setFont(font)
+            painter.drawText(video.adjusted(8, video.height() - 34, -8, -6),
+                             Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+                             label)
+
+    @staticmethod
+    def _paint_screen(painter, rect):
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor("#101f31"))
+        painter.drawRoundedRect(rect, 10, 10)
+        painter.setPen(QPen(QColor("#27415c"), 1))
+        painter.drawRoundedRect(rect.adjusted(1, 1, -1, -1), 10, 10)
+        painter.setPen(QColor("#7f9ab3"))
+        font = QFont()
+        font.setPointSize(9)
+        painter.setFont(font)
+        painter.drawText(rect.adjusted(12, 8, -12, 0),
+                         Qt.AlignmentFlag.AlignLeft, "MAPPED POINTER")
+        inner = rect.adjusted(18, 34, -18, -18)
+        painter.setPen(QPen(QColor("#1c3550"), 1))
+        painter.setBrush(QColor("#08111c"))
+        painter.drawRoundedRect(inner, 6, 6)
+        # Centre guides make it obvious when the mapping is stuck in a corner.
+        painter.setPen(QPen(QColor("#18283a"), 1, Qt.PenStyle.DashLine))
+        painter.drawLine(inner.left(), inner.center().y(), inner.right(), inner.center().y())
+        painter.drawLine(inner.center().x(), inner.top(), inner.center().x(), inner.bottom())
+
+    def _paint_video(self, painter, rect):
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor("#08111c"))
+        painter.drawRoundedRect(rect, 10, 10)
+        payload = self._payload
+        if not payload:
+            return
+        image = payload.get("image")
+        if image is None or image.isNull():
+            return
+        scaled = image.scaled(rect.size(), Qt.AspectRatioMode.KeepAspectRatio,
+                              Qt.TransformationMode.SmoothTransformation)
+        target = QRect(0, 0, scaled.width(), scaled.height())
+        target.moveCenter(rect.center())
+        painter.drawImage(target, scaled)
+
+        points = payload.get("points") or []
+        hand = payload.get("mode") == "hand" and len(points) >= 21
+
+        def to_widget(index):
+            px, py = points[index]
+            return (target.left() + px * target.width(),
+                    target.top() + py * target.height())
+
+        if hand:
+            painter.setPen(QPen(QColor("#38bdf8"), 2))
+            for a, b in HAND_CONNECTIONS:
+                x1, y1 = to_widget(a)
+                x2, y2 = to_widget(b)
+                painter.drawLine(int(x1), int(y1), int(x2), int(y2))
+        for index, point in enumerate(points):
+            px, py = point
+            x = target.left() + px * target.width()
+            y = target.top() + py * target.height()
+            if hand:
+                color = QColor("#f59e0b") if index == 8 else QColor("#e2f3ff")
+                radius = 6 if index == 8 else 3
+            else:
+                color = QColor("#f472b6") if index in (468, 473) else QColor("#67e8f9")
+                radius = 5 if index in (468, 473) else 2
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(color)
+            painter.drawEllipse(int(x - radius), int(y - radius), radius * 2, radius * 2)
+
+        cursor = payload.get("cursor")
+        if cursor is None:
+            return
+        screen = self._screen_rect().adjusted(18, 34, -18, -18)
+        cx = screen.left() + max(0.0, min(1.0, cursor[0])) * screen.width()
+        cy = screen.top() + max(0.0, min(1.0, cursor[1])) * screen.height()
+        painter.setPen(QPen(QColor("#ef4444"), 1, Qt.PenStyle.DashLine))
+        painter.drawLine(screen.left(), int(cy), screen.right(), int(cy))
+        painter.drawLine(int(cx), screen.top(), int(cx), screen.bottom())
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor("#ef4444"))
+        painter.drawEllipse(int(cx - 6), int(cy - 6), 12, 12)
+        painter.setBrush(QColor("#ffffff"))
+        painter.drawEllipse(int(cx - 2), int(cy - 2), 4, 4)
+        if not payload.get("calibrated", True):
+            painter.setPen(QColor("#fbbf24"))
+            painter.drawText(screen.adjusted(10, 0, -10, -8),
+                             Qt.AlignmentFlag.AlignBottom | Qt.AlignmentFlag.AlignHCenter,
+                             "Not calibrated")
+
+
 class Bus(QObject):
     status = Signal(str)
 
@@ -66,7 +279,12 @@ class AccessFlowWindow(QMainWindow):
         self.settings = QSettings("Vidushi", APP_NAME)
         self.bus = Bus()
         self.actions = WindowsActions()
-        self.engine = InteractionEngine(self.actions, on_pause=self._pause_workers)
+        # Typing and UI automation run on their own thread so the interface never
+        # freezes mid-dictation and Emergency pause stays responsive.
+        self.action_executor = ActionExecutor(self.actions, on_error=self._report_error)
+        self.engine = InteractionEngine(
+            self.actions, on_pause=self._pause_workers,
+            on_error=self._report_error, executor=self.action_executor)
         self.vision_worker = None
         self.voice_worker = None
         # Workers keep tearing down MediaPipe/audio after a pause request, so they
@@ -76,20 +294,21 @@ class AccessFlowWindow(QMainWindow):
         self._pending_calibration = False
         self._quitting = False
         self.running = False
-        self.gaze_transform = None
-        saved_transform = self.settings.value("gaze/transform_v3", "")
-        if saved_transform:
-            try:
-                self.gaze_transform = json.loads(saved_transform)
-            except (TypeError, ValueError):
-                self.gaze_transform = None
-        self.calibration_samples = []
+        self.calibration_notice = ""
+        self.safety_warning = ""
+        self.gaze_transform = self._load_calibration()
+        # Samples for the current target, and the accepted mean per target.
+        self.calibration_buffer = deque(maxlen=30)
+        self.calibration_points = {}
         self.calibration_target_index = 0
         self.calibration_target_started = 0.0
         self.calibration_timer = QTimer(self)
-        self.calibration_timer.timeout.connect(self._next_calibration_target)
+        self.calibration_timer.timeout.connect(self._poll_calibration)
         self.calibration_overlay = None
         self.download_worker = None
+        self.preview_worker = None
+        self.preview_mode = None
+        self._pending_preview = None
         self.setWindowTitle("AccessFlow")
         self.resize(1120, 740)
         self.setMinimumSize(920, 620)
@@ -100,8 +319,10 @@ class AccessFlowWindow(QMainWindow):
         self.esc_shortcut.activated.connect(self._pause)
         self.esc_listener = GlobalEscapeListener(self)
         self.esc_listener.escaped.connect(self._global_escape)
+        self.esc_listener.failed.connect(self._hook_failed)
         self.pointer_listener = GlobalPointerActivity(self)
         self.pointer_listener.activity.connect(self._touchpad_takeover)
+        self.pointer_listener.failed.connect(self._hook_failed)
         if sys.platform == "win32":
             self.esc_listener.start()
             self.pointer_listener.start()
@@ -126,7 +347,8 @@ class AccessFlowWindow(QMainWindow):
 
         self.pages = QStackedWidget()
         self.nav_buttons = []
-        for index, name in enumerate(["Dashboard", "Input methods", "Calibration", "Accessibility", "About"]):
+        for index, name in enumerate(["Dashboard", "Input methods", "Calibration",
+                                      "Tracking preview", "Accessibility", "About"]):
             button = QPushButton(name)
             button.setObjectName("nav")
             button.setCheckable(True)
@@ -138,8 +360,12 @@ class AccessFlowWindow(QMainWindow):
         self.status_label = QLabel("Paused")
         self.status_label.setObjectName("sideStatus")
         side.addWidget(self.status_label)
+        # Worker and action threads report through the bus so widgets are only
+        # touched on the GUI thread.
+        self.bus.status.connect(self.status_label.setText)
 
-        for page in (self._dashboard(), self._inputs(), self._calibration(), self._accessibility(), self._about()):
+        for page in (self._dashboard(), self._inputs(), self._calibration(),
+                     self._preview(), self._accessibility(), self._about()):
             self.pages.addWidget(page)
         layout.addWidget(sidebar)
         layout.addWidget(self.pages, 1)
@@ -195,6 +421,7 @@ class AccessFlowWindow(QMainWindow):
         note = QLabel("Camera tracking combines gaze, head, and hand input through one webcam owner. Voice recognition is local and needs an extracted Vosk model folder. Inputs start only when selected here.")
         note.setObjectName("notice")
         note.setWordWrap(True)
+        self.dashboard_note = note
         box.addWidget(note)
         box.addStretch()
         return page
@@ -203,10 +430,10 @@ class AccessFlowWindow(QMainWindow):
         page, box = self._page("Input methods", "Select what AccessFlow should listen to when you start a session.")
         self.input_checks = {}
         definitions = [
-            ("gaze", "Eye gaze", "Moves the pointer from eye direction. Selecting it turns Head tracking off. First-run face model downloads from MediaPipe."),
-            ("gestures", "Hand gestures", "Point to move and pinch to click. Shares the camera worker with gaze and head tracking."),
+            ("gaze", "Eye gaze", "Moves the pointer from calibrated eye direction. Selecting it turns Head tracking off. Calibrate first, then preview the mapping. The first-run face model downloads from MediaPipe."),
+            ("gestures", "Hand gestures", "Steer with your index finger like a trackpad and pinch to click. The pointer freezes when your hand leaves the frame, so it never jumps back across the screen."),
             ("voice", "Voice commands and dictation", "Offline Vosk recognition; audio is processed locally."),
-            ("head", "Head tracking", "Moves the pointer from head movement. Selecting it turns Eye gaze off; it learns your neutral head position when the session starts. Uses the same face model as eye gaze.")
+            ("head", "Head tracking", "Moves the pointer from head movement relative to the neutral position learned at session start. Selecting it turns Eye gaze off. Uses the same face model as eye gaze.")
         ]
         for key, title, detail in definitions:
             card = self._card(title, detail)
@@ -251,7 +478,7 @@ class AccessFlowWindow(QMainWindow):
 
     def _calibration(self):
         page, box = self._page("Gaze calibration", "Calibrate nine screen points before eye gaze can control the pointer. Keep your head still and repeat if pointer placement is inaccurate.")
-        self.calibration_status = QLabel("Not calibrated")
+        self.calibration_status = QLabel(self.calibration_notice or "Not calibrated")
         self.calibration_status.setObjectName("notice")
         self.calibration_status.setWordWrap(True)
         box.addWidget(self.calibration_status)
@@ -259,13 +486,29 @@ class AccessFlowWindow(QMainWindow):
         start.setObjectName("primary")
         start.clicked.connect(self._begin_calibration)
         box.addWidget(start, 0, Qt.AlignmentFlag.AlignLeft)
-        box.addWidget(self._card("How it works", "AccessFlow samples your eye position while you look at each target. The mapping is saved locally. Keep your head still and repeat if pointer placement is inaccurate."))
+        preview = QPushButton("Preview eye mapping")
+        preview.clicked.connect(self._preview_gaze)
+        box.addWidget(preview, 0, Qt.AlignmentFlag.AlignLeft)
+        box.addWidget(self._card(
+            "How it works",
+            "AccessFlow samples your eye position while you look at each target "
+            "and fits a quadratic mapping, so the corners of the screen are not "
+            "short. The mapping is saved locally. Use Tracking preview to see "
+            "the mapped cursor before you use it on the desktop."))
         box.addStretch()
         return page
+
+    def _preview_gaze(self):
+        if self.calibration_overlay is not None:
+            self._stop_calibration()
+        self._navigate(PAGE_PREVIEW)
+        self._start_preview("gaze")
 
     def _begin_calibration(self):
         if self.running:
             self._pause()
+        if self.preview_worker is not None:
+            self._stop_preview()
         if self._retiring_workers:
             self._pending_calibration = True
             self.calibration_status.setText("Waiting for previous inputs to stop…")
@@ -273,7 +516,8 @@ class AccessFlowWindow(QMainWindow):
         if not self.input_checks["gaze"].isChecked():
             QMessageBox.information(self, "Select eye gaze", "Enable Eye gaze in Input methods, then start calibration.")
             return
-        self.calibration_samples = []
+        self.calibration_buffer.clear()
+        self.calibration_points = {}
         self.calibration_target_index = 0
         self.calibration_target_started = time.monotonic()
         screen = QApplication.primaryScreen().geometry()
@@ -282,7 +526,6 @@ class AccessFlowWindow(QMainWindow):
         self.calibration_overlay.setGeometry(screen)
         self.calibration_overlay.showFullScreen()
         self.calibration_overlay.cancelled.connect(self._stop_calibration)
-        self.calibration_overlay.installEventFilter(self)
         self.vision_worker = VisionWorker(pointer_width, pointer_height, gaze_enabled=True, gestures_enabled=False)
         self.vision_worker.gaze_sample.connect(self._collect_gaze_sample)
         self.vision_worker.status.connect(self._calibration_status)
@@ -290,72 +533,230 @@ class AccessFlowWindow(QMainWindow):
         self.calibration_status.setText("Preparing camera and gaze model…")
 
     def _collect_gaze_sample(self, sample):
-        if not self.calibration_timer.isActive() or time.monotonic() - self.calibration_target_started < 0.25:
-            return
-        self.calibration_samples.append((self.calibration_target_index, float(sample[0]), float(sample[1])))
+        """Buffer eye samples for the current target.
 
-    def _next_calibration_target(self):
-        if self.calibration_target_index < 8:
-            self.calibration_target_index += 1
-            self.calibration_target_started = time.monotonic()
-            self.calibration_overlay.target_index = self.calibration_target_index
-            self.calibration_overlay.update()
-            self.calibration_status.setText(f"Calibrating point {self.calibration_target_index + 1} of 9…")
-            self.calibration_timer.start(1800)
+        Only frames from a settled target are kept: the first moments after a
+        target appears still carry eye movement from the previous one.
+        """
+        if not self.calibration_timer.isActive() or self.calibration_overlay is None:
             return
+        if time.monotonic() - self.calibration_target_started < CALIBRATION_SAMPLE_GRACE:
+            return
+        self.calibration_buffer.append((float(sample[0]), float(sample[1])))
+
+    def _poll_calibration(self):
+        """Accept the current point once it has settled, then advance or finish."""
+        if self.calibration_overlay is None:
+            self.calibration_timer.stop()
+            return
+        elapsed = time.monotonic() - self.calibration_target_started
+        samples = np.asarray(self.calibration_buffer, dtype=float)
+        if len(samples) >= CALIBRATION_MIN_SAMPLES:
+            spread = float(np.max(np.std(samples, axis=0)))
+            if spread <= CALIBRATION_STABLE_STD:
+                self.calibration_points[self.calibration_target_index] = (
+                    float(np.mean(samples[:, 0])), float(np.mean(samples[:, 1])))
+                self.calibration_buffer.clear()
+                if self.calibration_target_index < len(self.calibration_overlay.targets) - 1:
+                    self.calibration_target_index += 1
+                    self.calibration_target_started = time.monotonic()
+                    self.calibration_overlay.target_index = self.calibration_target_index
+                    self.calibration_overlay.update()
+                    self.calibration_status.setText(
+                        f"Calibrating point {self.calibration_target_index + 1} of 9…")
+                else:
+                    self._finish_calibration()
+                return
+        if elapsed > CALIBRATION_POINT_TIMEOUT:
+            self.calibration_status.setText(
+                f"Calibration stopped at point {self.calibration_target_index + 1}: "
+                "no steady eye reading. Hold your head still, face the camera, and try again.")
+            self._stop_calibration(keep_message=True)
+
+    def _finish_calibration(self):
         self.calibration_timer.stop()
+        overlay = self.calibration_overlay
         try:
-            import numpy as np
-            features, targets = [], []
-            for target_index, (target_x, target_y) in enumerate(self.calibration_overlay.targets):
-                samples = [(rx, ry) for index, rx, ry in self.calibration_samples if index == target_index]
-                if len(samples) < 8:
-                    raise ValueError(f"Too few eye samples at point {target_index + 1}. Check camera framing and try again.")
-                center = np.median(np.asarray(samples), axis=0)
-                features.append([float(center[0]), float(center[1]), 1.0])
-                targets.append([target_x, target_y])
-            x = np.asarray(features)
-            y = np.asarray(targets)
-            matrix, _, rank, _ = np.linalg.lstsq(x, y, rcond=None)
-            if rank < 3:
-                raise ValueError("Eye movement was too small to calibrate. Keep the camera at eye level and try again.")
-            error = float(np.sqrt(np.mean((x @ matrix - y) ** 2)))
-            if error > 0.35:
-                raise ValueError(f"Calibration error too high ({error:.2f}). Improve lighting and try again.")
-            self.gaze_transform = matrix.tolist()
-            self.settings.setValue("gaze/transform_v3", json.dumps(self.gaze_transform))
-            # Reset pointer filters so the next session starts clean
-            if self.vision_worker:
-                self.vision_worker.pointer_filters["gaze"].reset()
-                self.vision_worker.pointer_filters["head"].reset()
+            targets = overlay.targets if overlay else []
+            features, screen_points = [], []
+            for index, (target_x, target_y) in enumerate(targets):
+                point = self.calibration_points.get(index)
+                if point is None:
+                    raise ValueError(f"Point {index + 1} was never measured.")
+                features.append([point[0], point[1]])
+                screen_points.append([target_x, target_y])
+            # A quadratic fit bends the mapping at the edges. The reference
+            # Eye-To-Mouse project uses the same polynomial family; a plain
+            # affine fit systematically misses the corners on most eyes.
+            matrix, error = fit_gaze_mapping(
+                features, screen_points, GAZE_MODEL_QUADRATIC)
+            if error > CALIBRATION_MAX_ERROR:
+                raise ValueError(
+                    f"Calibration error too high ({error * 100:.0f}% of the screen). "
+                    "Improve lighting and try again.")
+            # Build the mapping completely before adopting it, so a failed
+            # attempt never destroys a calibration that already worked.
+            matrix_list = matrix.tolist()
+            self.settings.setValue(CALIBRATION_KEY, json.dumps({
+                "feature": GAZE_FEATURE,
+                "model": GAZE_MODEL_QUADRATIC,
+                "screen": list(self.actions.screen_size()),
+                "matrix": matrix_list,
+            }))
+            self.gaze_transform = matrix_list
+            self.calibration_notice = f"Calibrated (fit error {error * 100:.1f}% of the screen)."
             self.calibration_status.setText("Calibration saved! You can now start Eye gaze.")
         except Exception as exc:
-            self.gaze_transform = None
-            self.settings.remove("gaze/transform_v3")
-            self.calibration_status.setText(f"Calibration did not finish: {exc}")
+            kept = " Your previous calibration was kept." if self.gaze_transform else ""
+            self.calibration_status.setText(f"Calibration did not finish: {exc}{kept}")
         finally:
-            self._stop_calibration()
+            self._stop_calibration(keep_message=True)
+
     def _calibration_status(self, message):
         if message == "Camera inputs active":
             self.calibration_target_started = time.monotonic()
-            self.calibration_status.setText("Calibrating point 1 of 9…")
-            self.calibration_timer.start(2000)
+            self.calibration_status.setText("Calibrating point 1 of 9… look at the red dot")
+            self.calibration_timer.start(100)
         elif message.startswith("Camera stopped") or message == "Camera unavailable":
-            self.calibration_timer.stop()
             self.calibration_status.setText(message)
-            self._stop_calibration()
+            self._stop_calibration(keep_message=True)
 
-    def _stop_calibration(self):
+    def _stop_calibration(self, keep_message=False):
         self.calibration_timer.stop()
+        self.calibration_buffer.clear()
         self._retire_worker(self.vision_worker)
         self.vision_worker = None
         if self.calibration_overlay:
             self.calibration_overlay.close()
             self.calibration_overlay = None
+        if not keep_message:
+            self.calibration_status.setText("Calibration cancelled")
 
-    def _calibration_cancelled(self, event):
-        self._stop_calibration()
-        event.accept()
+    def _load_calibration(self):
+        """Restore a saved gaze mapping, rejecting one made for another screen."""
+        saved = self.settings.value(CALIBRATION_KEY, "")
+        if not saved:
+            # Mapping saved by an earlier version, before screen size was stored.
+            saved = self.settings.value("gaze/transform_v3", "")
+        if not saved:
+            return None
+        try:
+            data = json.loads(saved)
+        except (TypeError, ValueError):
+            return None
+        if isinstance(data, list):
+            # Mapping saved before the screen size and feature were recorded.
+            matrix = _valid_gaze_matrix(data)
+            if matrix is None:
+                self.calibration_notice = "Saved calibration is unreadable; recalibrate."
+                return None
+            self.calibration_notice = "Recalibrate to record your screen size with the mapping."
+            return matrix
+        if not isinstance(data, dict) or data.get("feature") != GAZE_FEATURE:
+            self.calibration_notice = "Saved calibration used an older gaze feature; recalibrate."
+            return None
+        recorded = data.get("screen")
+        if recorded and list(recorded) != list(self.actions.screen_size()):
+            self.calibration_notice = (
+                "Saved calibration was made for a different screen size; recalibrate.")
+            return None
+        matrix = _valid_gaze_matrix(data.get("matrix"))
+        if matrix is None:
+            self.calibration_notice = "Saved calibration is unreadable; recalibrate."
+        elif data.get("model") != GAZE_MODEL_QUADRATIC or len(matrix) == 3:
+            # Still usable, but the linear fit misses the screen corners.
+            self.calibration_notice = (
+                "Saved calibration uses the older linear mapping. Recalibrate "
+                "for better accuracy near the screen edges.")
+        return matrix
+
+    def _preview(self):
+        page, box = self._page(
+            "Tracking preview",
+            "See what the camera sees and exactly where each input method sends "
+            "the pointer. Preview never moves the real pointer, so it is safe to "
+            "experiment before starting a session.")
+        row = QHBoxLayout()
+        for mode, label in (("hand", "Hand preview"), ("gaze", "Eye preview"),
+                            ("head", "Head preview")):
+            button = QPushButton(label)
+            button.clicked.connect(
+                lambda checked=False, m=mode: self._start_preview(m))
+            row.addWidget(button)
+        stop = QPushButton("Stop preview")
+        stop.clicked.connect(self._stop_preview)
+        row.addWidget(stop)
+        row.addStretch()
+        box.addLayout(row)
+
+        self.preview_widget = TrackingPreviewWidget()
+        box.addWidget(self.preview_widget, 1)
+
+        self.preview_status = QLabel("Idle")
+        self.preview_status.setObjectName("notice")
+        self.preview_status.setWordWrap(True)
+        box.addWidget(self.preview_status)
+
+        self.preview_hint = QLabel("")
+        self.preview_hint.setObjectName("subtitle")
+        self.preview_hint.setWordWrap(True)
+        box.addWidget(self.preview_hint)
+        return page
+
+    def _start_preview(self, mode):
+        if mode not in ("hand", "gaze", "head"):
+            return
+        if self.calibration_overlay is not None:
+            self._stop_calibration()
+        if self.running:
+            self._pause()
+        if self.preview_worker is not None:
+            self._stop_preview()
+        if self._retiring_workers:
+            self._pending_preview = mode
+            self.preview_status.setText("Waiting for the previous camera session to stop…")
+            return
+        pointer_width, pointer_height = self.actions.screen_size()
+        self.preview_worker = VisionWorker(
+            pointer_width, pointer_height,
+            gaze_enabled=(mode == "gaze"),
+            gestures_enabled=(mode == "hand"),
+            gaze_transform=self.gaze_transform if mode == "gaze" else None,
+            head_enabled=(mode == "head"),
+            preview=mode)
+        self.preview_worker.preview_ready.connect(self.preview_widget.set_payload)
+        self.preview_worker.status.connect(self._preview_status)
+        self.preview_worker.finished.connect(self._on_worker_finished)
+        self.preview_mode = mode
+        self.preview_widget.clear()
+        self.preview_worker.start()
+        hints = {
+            "hand": ("Move your index finger like a trackpad. The mapping is "
+                     "relative: the cursor moves with the finger's movement, not "
+                     "to where the finger points. Pinch thumb and index to click."),
+            "gaze": ("Look around the screen. Calibrated eye gaze maps absolute "
+                     "screen position; if the note says not calibrated, run the "
+                     "nine-point calibration first."),
+            "head": ("Move your head left/right/up/down. The first frames learn "
+                     "your neutral position; so do not move while the preview "
+                     "settles."),
+        }
+        self.preview_hint.setText(hints[mode])
+        self.preview_status.setText("Starting camera…")
+
+    def _preview_status(self, message):
+        self.preview_status.setText(message)
+
+    def _stop_preview(self):
+        worker = self.preview_worker
+        self.preview_worker = None
+        self.preview_mode = None
+        if hasattr(self, "preview_widget"):
+            self.preview_widget.clear()
+        if worker is not None:
+            self._retire_worker(worker)
+        if hasattr(self, "preview_status"):
+            self.preview_status.setText("Preview stopped")
 
     def _download_voice_model(self):
         if self.download_worker and self.download_worker.isRunning():
@@ -395,6 +796,8 @@ class AccessFlowWindow(QMainWindow):
         return page
 
     def _navigate(self, index):
+        if index != PAGE_PREVIEW and getattr(self, "preview_worker", None) is not None:
+            self._stop_preview()
         self.pages.setCurrentIndex(index)
         for i, button in enumerate(self.nav_buttons):
             button.setChecked(i == index)
@@ -440,6 +843,9 @@ class AccessFlowWindow(QMainWindow):
             self._start()
 
     def _start(self):
+        # A preview owns the camera until it is stopped.
+        if self.preview_worker is not None:
+            self._stop_preview()
         if self._retiring_workers:
             self._pending_start = True
             self.status_label.setText("Waiting for previous inputs to stop…")
@@ -454,7 +860,7 @@ class AccessFlowWindow(QMainWindow):
             return
         if gaze and not self.gaze_transform:
             QMessageBox.warning(self, "Calibrate gaze first", "Open Calibration and complete the nine-point calibration before starting eye gaze.")
-            self._navigate(2)
+            self._navigate(PAGE_CALIBRATION)
             return
         sources = []
         if gaze:
@@ -492,6 +898,14 @@ class AccessFlowWindow(QMainWindow):
             return
         self.engine.dispatch(event)
 
+    def _report_error(self, message):
+        """Show a failed action instead of discarding it silently.
+
+        Runs on whatever thread performed the action, so the message is handed
+        to the UI thread through the bus signal rather than touching a widget.
+        """
+        self.bus.status.emit(message)
+
     def _retire_worker(self, worker):
         """Stop a worker without blocking the GUI thread."""
         if worker is None:
@@ -501,7 +915,7 @@ class AccessFlowWindow(QMainWindow):
         with warnings.catch_warnings():
             # PySide warns when disconnecting a signal that has no listeners.
             warnings.simplefilter("ignore", RuntimeWarning)
-            for name in ("status", "event_ready", "gaze_sample"):
+            for name in ("status", "event_ready", "gaze_sample", "preview_ready"):
                 signal = getattr(worker, name, None)
                 if signal is not None:
                     try:
@@ -520,6 +934,9 @@ class AccessFlowWindow(QMainWindow):
         if worker in self._retiring_workers:
             self._retiring_workers.remove(worker)
         if worker is not None:
+            if worker is self.preview_worker:
+                self.preview_worker = None
+                self.preview_mode = None
             worker.deleteLater()
         if self._retiring_workers:
             return
@@ -532,10 +949,15 @@ class AccessFlowWindow(QMainWindow):
         elif self._pending_calibration:
             self._pending_calibration = False
             QTimer.singleShot(0, self._begin_calibration)
+        elif self._pending_preview:
+            mode = self._pending_preview
+            self._pending_preview = None
+            QTimer.singleShot(0, lambda: self._start_preview(mode))
 
     def _pause_workers(self):
         if self.calibration_timer.isActive():
             self._stop_calibration()
+        self._stop_preview()
         self._retire_worker(self.vision_worker)
         self._retire_worker(self.voice_worker)
         self.vision_worker = None
@@ -545,6 +967,7 @@ class AccessFlowWindow(QMainWindow):
         # Update visible state first: stopping workers must never delay feedback.
         self._pending_start = False
         self._pending_calibration = False
+        self._pending_preview = None
         self.running = False
         self.start_button.setText("Start selected inputs")
         self.status_label.setText("Paused")
@@ -552,10 +975,27 @@ class AccessFlowWindow(QMainWindow):
         self.session_card.layout().itemAt(1).widget().setText("Camera and microphone are off.")
         self.engine.pause()
 
+    def _hook_failed(self, message):
+        """Warn when a global hook could not be installed.
+
+        Installing a low-level hook can fail (policy, exhausted hook quotas, a
+        different desktop session). Running silently would leave the user
+        believing Escape is always available, so say what still works.
+        """
+        self.safety_warning = message
+        self.status_label.setText(message)
+        note = getattr(self, "dashboard_note", None)
+        if note is not None:
+            note.setText(f"Safety warning: {message}")
+        if self.tray.isVisible():
+            self.tray.showMessage("AccessFlow safety", message,
+                                  QSystemTrayIcon.MessageIcon.Warning, 10000)
+
     def _global_escape(self):
         # The hook does not consume Escape, so the focused app still gets it.
         if (self.running or self._pending_start or self._pending_calibration
-                or self.calibration_overlay is not None):
+                or self._pending_preview or self.calibration_overlay is not None
+                or self.preview_worker is not None):
             self._pause()
 
     def _touchpad_takeover(self):
@@ -572,6 +1012,9 @@ class AccessFlowWindow(QMainWindow):
         # Stop observing input before any deferred shutdown begins.
         self._stop_global_listeners()
         self._pause()
+        # _pause() cancels queued work; joining here keeps the process from
+        # exiting halfway through a keystroke (which can leave a modifier held).
+        self.action_executor.stop()
         if self._retiring_workers:
             self._quitting = True
             self.hide()

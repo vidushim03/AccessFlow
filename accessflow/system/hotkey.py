@@ -95,6 +95,13 @@ if sys.platform == "win32":
 class _GlobalHook(QThread):
     """Run a low-level Windows hook on its own message-pumping thread."""
 
+    #: Human-readable name used when the hook cannot be installed.
+    LABEL = "Global hook"
+    #: What the user can still rely on if installation fails.
+    FALLBACK = "the in-app controls still work"
+
+    failed = Signal(str)
+
     def __init__(self, hook_id, parent=None):
         super().__init__(parent)
         self._hook_id = hook_id
@@ -127,6 +134,10 @@ class _GlobalHook(QThread):
                 _user32.UnhookWindowsHookEx(self._hook)
                 self._hook = None
             self._thread_id = 0
+            if not self._stopping:
+                # Never let the app keep promising a shortcut it does not have.
+                self.failed.emit(
+                    f"{self.LABEL} could not be installed; {self.FALLBACK}")
             return
         try:
             while _user32.GetMessageW(ctypes.byref(message), None, 0, 0) > 0:
@@ -137,15 +148,19 @@ class _GlobalHook(QThread):
             self._hook = None
             self._thread_id = 0
 
-    def stop(self):
+    def stop(self, timeout=500):
         self._stopping = True
         if sys.platform == "win32" and self._thread_id:
             _user32.PostThreadMessageW(self._thread_id, WM_QUIT, 0, 0)
-        self.wait(2000)
+        if self.isRunning():
+            self.wait(timeout)
 
 
 class GlobalEscapeListener(_GlobalHook):
     """Emit ``escaped`` when Escape is pressed on any window."""
+
+    LABEL = "The system-wide Escape shortcut"
+    FALLBACK = "Escape still pauses while an AccessFlow window has focus"
 
     escaped = Signal()
 
@@ -168,6 +183,9 @@ class GlobalPointerActivity(_GlobalHook):
     """
 
     activity = Signal()
+
+    LABEL = "Touchpad takeover detection"
+    FALLBACK = "camera pointer output continues until you pause"
 
     def __init__(self, parent=None):
         super().__init__(WH_MOUSE_LL, parent)
