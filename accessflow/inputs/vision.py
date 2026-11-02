@@ -40,8 +40,11 @@ HEAD_Y_GAIN = 2.4
 # permanent neutral pose. The window is restarted whenever the samples move too
 # far apart, so a user who is still settling into place never freezes a moving
 # pose as "neutral".
-HEAD_NEUTRAL_SAMPLES = 8
-HEAD_NEUTRAL_SPREAD = 0.008
+HEAD_NEUTRAL_SAMPLES = 12
+# Tolerate normal landmark jitter while still rejecting a moving head.
+# 3 sigma of a 0.003 jitter window is ~0.009; 0.015 is a safe bound that
+# lets a still head settle but restarts if the head is actually moving.
+HEAD_NEUTRAL_SPREAD = 0.015
 # A single frame that claims the pointer should teleport across more than this
 # fraction of the screen diagonal is a landmark glitch, not real motion.
 POINTER_JUMP_LIMIT = 0.35
@@ -141,6 +144,11 @@ class HeadTracker:
     def update(self, feature, anchor=None):
         """Map a nose-tip feature to a smoothed pointer position.
 
+        Mirrors the reference tracker in vision-access-hci: a plain EMA
+        (alpha=0.18) on the *absolute* target position, with no deadzone and
+        no per-frame step clamp. That heavy low-pass is what keeps a still
+        head from dragging the pointer.
+
         Args:
             feature: (x, y) raw nose-tip landmark in normalised image space.
             anchor: Optional (x, y) normalised screen position to anchor the
@@ -153,9 +161,11 @@ class HeadTracker:
             (x, y) normalised screen position, or None while learning the
             neutral pose.
         """
+        # Learn the neutral pose from a stable 8-sample window while the
+        # pointer is held at the requested anchor. A stable window keeps a
+        # single bad frame from permanently biasing the neutral pose.
         if anchor is not None:
             if not self.activated:
-                # Hold the pointer still until the neutral window is stable.
                 origin = self._stable_origin(feature)
                 if origin is None:
                     return None
@@ -169,16 +179,21 @@ class HeadTracker:
             # Takeover/recenter: adopt the current pose as the new neutral.
             self._anchor_to(feature, anchor)
             return self.smoothed
+        # If the head tracker has not learned its neutral pose yet, do so
+        # before emitting anything so the first frames do not teleport the
+        # pointer.
         if self.origin is None:
             origin = self._stable_origin(feature)
             if origin is None:
                 return None
             self.origin = origin
             self.activated = True
-        dx = (feature[0] - self.origin[0]) * self.gain_x
-        dy = (feature[1] - self.origin[1]) * self.gain_y
-        target = (max(0.0, min(1.0, 0.5 + dx)),
-                  max(0.0, min(1.0, 0.5 + dy)))
+        # Plain EMA on absolute position (no deadzone, no step clamp), as in
+        # vision-access-hci.
+        target = (
+            max(0.0, min(1.0, (feature[0] - self.origin[0]) * self.gain_x + 0.5)),
+            max(0.0, min(1.0, (feature[1] - self.origin[1]) * self.gain_y + 0.5)),
+        )
         if self.smoothed is None:
             self.smoothed = target
         else:
