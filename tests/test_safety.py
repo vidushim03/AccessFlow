@@ -188,6 +188,34 @@ class VoicePhraseTests(unittest.TestCase):
         self.assertEqual(self.events[0].payload["text"], "Hello World")
 
 
+class MouseButtonMappingTests(unittest.TestCase):
+    def test_swapped_windows_buttons_are_compensated(self):
+        with mock.patch.object(
+                actions_module._user32, "GetSystemMetrics", return_value=1):
+            self.assertEqual(actions_module._physical_button("left"), "right")
+            self.assertEqual(actions_module._physical_button("right"), "left")
+            self.assertEqual(actions_module._physical_button("middle"), "middle")
+
+    def test_direct_click_sends_physical_button_for_requested_logical_click(self):
+        calls = []
+        fake_pyautogui = type(
+            "FakePyAutoGUI", (), {
+                "click": staticmethod(
+                    lambda **kwargs: calls.append(kwargs)),
+            })()
+        actions = WindowsActions()
+        with (
+            mock.patch.object(
+                actions_module._user32, "GetSystemMetrics", return_value=1),
+            mock.patch.object(
+                actions_module, "_pyautogui", return_value=fake_pyautogui),
+        ):
+            actions.click("left")
+            actions.click("right")
+        self.assertEqual(
+            [call["button"] for call in calls], ["right", "left"])
+
+
 class ExecutorTests(unittest.TestCase):
     def setUp(self):
         self.actions = FakeActions()

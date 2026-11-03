@@ -10,6 +10,23 @@ logger = logging.getLogger(__name__)
 _user32 = ctypes.windll.user32
 
 
+def _physical_button(logical_button):
+    """Translate a requested click for Windows' current mouse-button mapping.
+
+    SendInput-style mouse libraries address physical buttons. If Windows has
+    swapped the primary and secondary meanings, invert only left/right so the
+    requested logical action remains consistent across input methods.
+    """
+    if logical_button not in ("left", "right"):
+        return logical_button
+    try:
+        if _user32.GetSystemMetrics(23):  # SM_SWAPBUTTON
+            return "right" if logical_button == "left" else "left"
+    except Exception:
+        logger.debug("Could not read Windows mouse-button mapping")
+    return logical_button
+
+
 def _pyautogui():
     """Import/configure PyAutoGUI only after Qt has initialized Windows DPI.
 
@@ -120,7 +137,9 @@ class WindowsActions:
         _pyautogui().moveTo(int(x), int(y), duration=0)
 
     def click(self, button="left", clicks=1):
-        _pyautogui().click(button=button, clicks=max(1, min(int(clicks), 2)))
+        _pyautogui().click(
+            button=_physical_button(button),
+            clicks=max(1, min(int(clicks), 2)))
 
     def click_target(self, button="left", x=None, y=None):
         """Activate the UI Automation control at the click point if possible.
@@ -134,6 +153,7 @@ class WindowsActions:
         if x is None or y is None:
             x, y = pyautogui.position()
         x, y = int(x), int(y)
+        physical_button = _physical_button(button)
         # The AccessFlow keyboard is a non-activating Qt tool window. Use a
         # real mouse click for its key buttons so Qt receives the normal
         # pressed/released sequence and emits ``key_requested``. UIA Invoke
@@ -151,7 +171,7 @@ class WindowsActions:
                     if (info.control_type == "Window"
                             and (info.name or "").strip().casefold()
                             == "accessflow keyboard"):
-                        pyautogui.click(x=x, y=y, button=button)
+                        pyautogui.click(x=x, y=y, button=physical_button)
                         return
                     ancestor = ancestor.parent()
                     if ancestor is None:
@@ -164,7 +184,7 @@ class WindowsActions:
             try:
                 if candidate is not None and candidate.element_info.control_type in {
                         "Document", "Edit"}:
-                    pyautogui.click(x=x, y=y, button=button)
+                    pyautogui.click(x=x, y=y, button=physical_button)
                     return
             except Exception:
                 pass
@@ -187,7 +207,7 @@ class WindowsActions:
                             return
                         except Exception:
                             try:
-                                element.click_input()
+                                element.click_input(button=physical_button)
                                 return
                             except Exception:
                                 break
@@ -196,7 +216,7 @@ class WindowsActions:
                         break
             except Exception as exc:
                 logger.debug("UIA target click fell back to mouse input: %s", exc)
-        pyautogui.click(x=x, y=y, button=button)
+        pyautogui.click(x=x, y=y, button=physical_button)
 
     def scroll(self, amount):
         _pyautogui().scroll(int(max(-10, min(10, amount))))
@@ -251,7 +271,7 @@ class WindowsActions:
         control = window.child_window(title=str(control_title))
         if not window.exists(timeout=1) or not control.exists(timeout=1):
             raise LookupError("The requested control was not found")
-        control.click_input()
+        control.click_input(button=_physical_button("left"))
 
 
 class ActionExecutor:
