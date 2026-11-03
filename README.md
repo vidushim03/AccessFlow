@@ -1,48 +1,136 @@
+<div align="center">
+
 # AccessFlow
 
-Windows desktop MVP for adaptive multimodal assistive interaction. Python 3.11 is recommended.
+### Alternative computer interaction for an HCI mini-project
 
-## Start
+**Hand tracking · Head tracking · Dwell selection · Offline voice · On-screen keyboard**
 
-    .venv\Scripts\python.exe main.py
+![Platform: Windows](https://img.shields.io/badge/platform-Windows-0078D4?logo=windows&logoColor=white)
+![Python 3.11](https://img.shields.io/badge/python-3.11-3776AB?logo=python&logoColor=white)
+![HCI mini-project](https://img.shields.io/badge/project-HCI%20mini--project-6B5B95)
 
-Dependencies are listed in requirements.txt.
+</div>
 
-## Connected inputs
+AccessFlow is a Windows desktop prototype exploring alternative ways to control a computer. It combines webcam-based hand and head pointer control, dwell selection, offline speech input, and an on-screen keyboard in one application.
 
-- Head tracking and hand gestures share a single OpenCV camera capture worker. Camera startup tries DirectShow, Media Foundation, and OpenCV's automatic backend on the first two device indices, and requires an actual frame before proceeding. If no camera opens, AccessFlow explains that another app may be using it and points to Windows camera privacy permissions. Face/hand models are fetched from official MediaPipe model storage on first camera start.
-- Head tracking moves the pointer from the raw nose-tip position relative to a learned neutral pose, smoothed with a plain 0.18 EMA. The neutral pose is learned from a short stable window while the pointer is held still, so a bad first frame or sitting down mid-detection cannot bias the cursor. The pointer is anchored to wherever it already is, and re-anchors when head control takes over from another input, so starting a session, switching methods, or recentering never jumps the cursor. Eye gaze is not offered as an input in this version.
-- Head tracking supports one-shot left-click dwell. When Windows exposes a control, dwell follows that control and restarts if the pointer moves to a different control; otherwise it uses a small screen-position radius. AccessFlow attempts a Windows UI Automation activation at completion, with a coordinate click fallback. Hand dwell uses the same target change reset. The live session shows a progress ring; the Tracking preview never clicks. Right-click remains available through Voice.
-- Local voice commands and dictation use Vosk. Use the Download small English model button in Input methods, then enable voice. The model is stored under your local app data.
-- Supported voice commands include left click, right click, scroll up/down, open Notepad/Calculator, and “type …” dictation. “Pause AccessFlow” stops all active providers. The Accessibility page has a built-in keyboard for hand and head pointer users.
-- All events pass through the confidence/source gate before reaching WindowsActions.
-- pywinauto is used for named control clicks and window activation; PyAutoGUI provides coordinate mouse/keyboard actions. The AccessFlow on-screen keyboard stays open without taking text focus, so typing does not depend on Windows’ On-Screen Keyboard.
-- Escape is observed system-wide, so it pauses a running session even when another app has focus. The key is not consumed, so the focused app still receives it normally. Input aimed at elevated (administrator) windows cannot be observed. If Windows refuses to install the global hook (group policy, exhausted hook quota), AccessFlow says so in the session status, on the dashboard, and in a tray notification instead of quietly running without it; Escape then still pauses while an AccessFlow window has focus.
-- The touchpad and mouse are never disabled. When real touchpad or mouse movement is detected, camera pointer output steps aside for 1.5 seconds, then resumes automatically.
-- The Tracking preview page shows the live mirrored camera, its landmarks, and a miniature screen with the current mapping and smoothing applied. It never moves the real pointer, so hand and head mapping can be checked safely before starting a session.
-- Settings persist locally with QSettings. AccessFlow does not record raw audio or video.
+> **Project status:** Working prototype for demonstration and usability evaluation. Performance can vary with the computer, camera, microphone, lighting, and user setup. AccessFlow is not a certified assistive product.
 
-Head tracking learns a neutral position at session start and does not require eye calibration. Eye gaze and its calibration flow are not exposed in this version. Providers are opt-in. Use Escape from any application or Emergency pause to stop them; the UI pauses immediately and camera/audio workers finish shutting down in the background.
+## Contents
 
+- [What it can do](#what-it-can-do)
+- [Voice phrases](#voice-phrases)
+- [Requirements](#requirements)
+- [Setup](#setup)
+- [First use](#first-use)
+- [On-screen keyboard](#using-the-on-screen-keyboard)
+- [Project structure](#project-structure)
+- [Privacy and limitations](#privacy-and-limitations)
+- [Tests](#tests)
+- [HCI evaluation materials](#hci-evaluation-materials)
 
-## Input stability
+## What it can do
 
-- Hand control is a relative trackpad mapping, not absolute fingertip aiming: only movement while the hand is visible moves the pointer. A fingertip EMA (0.60) reduces landmark jitter; 1.6× sensitivity, a 0.008 dead zone without reference leak, and a per-frame 220 px cap balance response and cursor stability. Pointer movement continues while dwell is counting down, and moving the index finger beyond its fixed stability radius cancels the click timer. Keep only the index fingertip still for a left click; the other fingers may be relaxed. Raise only index and middle fingers and keep the index fingertip still for a right click. Pinching is excluded from click recognition; move away after a click to re-arm. For head and hand, dwell restarts when a Windows UI Automation control changes. If an app does not expose controls, dwell uses a small screen-position radius instead. The pointer freezes while the hand leaves the frame and only re-anchors on the next detection, so a hand returning elsewhere never teleports the cursor. Head tracking uses a plain EMA on absolute position; brief hand-tracking dropouts do not immediately switch control to face tracking.
-- Voice commands use Vosk word confidence and discard low-confidence recognition. Dictation is scored on the average word instead, because one shaky word should not discard a whole sentence.
-- Typing and UI Automation target activation run on a dedicated action thread, so dictation and control lookup cannot freeze the window. Pointer movement, direct clicks, and scroll stay synchronous because they take milliseconds.
-- Pausing cancels that work: the action backlog is dropped and a phrase that is already being typed stops within about 64 ms (32 characters) instead of typing to the end. Quitting waits for the action thread, so the process never exits halfway through a keystroke and leaves a modifier held.
-- Voice audio is buffered to a bounded queue; if recognition falls behind realtime, audio is dropped and reported instead of growing without limit.
+- **Hand pointer:** Move the pointer by moving the index finger, as with a trackpad. Hold the index fingertip steady to left-click. Raise and hold the index and middle fingers to right-click. Pinching is not used for clicking.
+- **Head pointer:** Move the pointer with head movement. AccessFlow learns a neutral position at the beginning of a session. Hold the pointer steady for a dwell left-click.
+- **Adjustable dwell:** Choose a dwell duration from 500 to 3000 milliseconds. A progress indicator shows when a dwell click is about to happen.
+- **Offline voice input:** After installing the Vosk speech model, use speech for dictation and supported desktop actions. The model is downloaded once and recognition runs locally.
+- **On-screen keyboard:** Open AccessFlow’s keyboard and select its keys with the hand or head pointer, or with a mouse or touchpad.
+- **Tracking preview:** Inspect hand or head tracking before starting a session. Preview mode does not move the real pointer or click.
+- **Pause controls:** Pause from AccessFlow or press Escape while a session is active.
 
-Syntax, offscreen UI construction, and automated regression tests have been validated. A live Windows run is still needed to confirm camera tracking, Windows UI Automation across apps, keyboard focus preservation, and microphone/voice behaviour on this device.
+### Voice phrases
+
+Examples supported by the current voice input include:
+
+| Say | Result |
+| --- | --- |
+| `type hello there` | Types “hello there” into the focused application |
+| `left click` | Sends a left click at the pointer |
+| `right click` | Sends a right click at the pointer |
+| `scroll up` / `scroll down` | Scrolls at the pointer |
+| `open Notepad` / `open Calculator` | Opens and focuses the application |
+| `space` / `new line` | Types a space or presses Enter |
+| `pause AccessFlow` | Pauses active input methods |
+
+Speech recognition confidence and microphone conditions can affect whether a phrase is accepted. The app does not store raw audio.
+
+## Requirements
+
+- Windows 10 or 11
+- Python 3.11 recommended
+- A webcam for hand or head tracking
+- A microphone for voice input
+- Internet access for the first download of the speech model and camera tracking models
+
+## Setup
+
+Open PowerShell in the project folder and run:
+
+```powershell
+py -3.11 -m venv .venv
+.venv\Scripts\Activate.ps1
+python -m pip install --upgrade pip
+pip install -r requirements.txt
+python main.py
+```
+
+If PowerShell blocks virtual-environment activation, run the interpreter directly instead:
+
+```powershell
+.venv\Scripts\python.exe -m pip install -r requirements.txt
+.venv\Scripts\python.exe main.py
+```
+
+On first use, allow camera and microphone access in Windows privacy settings when prompted.
+
+## First use
+
+1. Open **Tracking preview** and choose **Hand preview** or **Head preview** to check camera tracking.
+2. Open **Input methods** and enable the methods you want to use.
+3. For voice input, choose **Download small English model** and wait for **Offline voice model ready**. This downloads the Vosk model into your local AccessFlow application data. You can also browse to an already extracted Vosk model folder.
+4. Set the dwell duration under **Accessibility** if needed.
+5. Start the session. Use **Pause inputs**, **Emergency pause**, or Escape to stop active input.
+
+The hand pointer is relative: move the index finger to steer it across the screen. It does not jump to the screen position your fingertip points at. The head pointer learns its starting neutral position when tracking begins; use **Recenter head tracking** if you change posture.
+
+## Using the on-screen keyboard
+
+Open **Accessibility → Open AccessFlow Keyboard**. Select the text field in the application where you want to type, then choose keys on the AccessFlow keyboard using your active pointer or a mouse/touchpad. The keyboard is built into AccessFlow and does not rely on the Windows On-Screen Keyboard.
+
+## Project structure
+
+```text
+AccessFlow/
+├── accessflow/
+│   ├── core/       # Interaction events and the shared action gate
+│   ├── inputs/     # Hand, head, dwell, and voice input workers
+│   └── system/     # Windows pointer, keyboard, and application actions
+├── tests/          # Automated regression tests
+├── docs/           # HCI evaluation materials
+├── main.py         # PySide6 desktop interface
+└── requirements.txt
+```
+
+## Privacy and limitations
+
+- Vosk speech recognition runs locally after the model is downloaded. AccessFlow does not record raw audio or video.
+- Webcam tracking requires the camera to remain available to AccessFlow. Another application using the camera may prevent tracking from starting.
+- Eye gaze is not available as an input in this version.
+- AccessFlow uses Windows desktop input APIs. Elevated applications and secure Windows screens may block normal input, and behavior can vary across applications.
+- This prototype has not been established as suitable for every user's access needs. Evaluate it with users and tasks before relying on it.
 
 ## Tests
 
-    .venv\Scripts\python.exe -m unittest discover -s tests -v
+Run the automated regression suite from the project folder:
 
-`tests/test_safety.py` covers the pause path (backlog dropped, typing stopped mid-phrase, thread joined on quit), the confidence gate per action, disabled sources, failed-action reporting, and a failed hook install being reported. `tests/test_calibration.py` and the gaze-mapping cases in `tests/test_mapping.py` cover retained legacy calibration math; gaze is not exposed in the current input flow. Other mapping tests cover still-hand stability, reacquisition, and stable head-neutral learning. These tests do not need a camera, microphone, or person.
+```powershell
+.venv\Scripts\python.exe -m unittest discover -s tests -v
+```
 
-- Camera output coordinates use PyAutoGUI’s physical-pixel screen size, matching Windows display scaling.
+The tests cover input mapping, dwell behavior, voice command routing, action safety, and calibration-related helper code. They do not replace a live camera, microphone, or cross-application evaluation.
 
-## HCI evaluation
+## HCI evaluation materials
 
-The current prototype's task-based usability evaluation plan and a coded-results template are in [`docs/HCI_EVALUATION.md`](docs/HCI_EVALUATION.md) and [`docs/evaluation_results_template.csv`](docs/evaluation_results_template.csv). The plan focuses on observed usability of the existing workflows; it does not claim proven accessibility benefit.
+- [Task-based usability evaluation plan](docs/HCI_EVALUATION.md)
+- [Evaluation results template](docs/evaluation_results_template.csv)
