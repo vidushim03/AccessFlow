@@ -22,11 +22,12 @@ DICTATION_MIN_CONFIDENCE = 0.60
 # word, while the whitelist still prevents arbitrary program execution.
 OPEN_APP_MIN_CONFIDENCE = 0.60
 KEY_COMMAND_MIN_CONFIDENCE = 0.60
-# A correct left-click command can have one weakly scored word (often "left")
-# even when the phrase as a whole is clear. Keep an exact-phrase check and use
-# average word confidence, while leaving destructive/open/scroll commands at
-# the stricter weakest-word threshold.
+# A correct click command can have one weakly scored word even when the phrase
+# as a whole is clear. Exact phrase matching keeps the action constrained;
+# average confidence avoids rejecting it for one weak word.
 LEFT_CLICK_MIN_CONFIDENCE = 0.65
+CLICK_COMMAND_MIN_CONFIDENCE = 0.65
+SCROLL_COMMAND_MIN_CONFIDENCE = 0.60
 # Blocks waiting for the recogniser (8000 frames at 16 kHz = 0.5 s each).
 # Recognition slower than realtime must drop audio, not grow without bound.
 AUDIO_QUEUE_BLOCKS = 50
@@ -109,7 +110,9 @@ class VoiceWorker(QThread):
 
     def _phrase(self, value, confidence, average=None):
         recognized = str(value).strip()
-        text = recognized.lower()
+        # Vosk sometimes returns punctuation or repeated whitespace at the end
+        # of a final segment. Normalize those without changing dictation text.
+        text = " ".join(recognized.casefold().strip(" .,!?").split())
         confidence = float(confidence)
         average = confidence if average is None else float(average)
         if not text or not math.isfinite(confidence) or not math.isfinite(average):
@@ -144,10 +147,14 @@ class VoiceWorker(QThread):
                 {"key": key}))
             return
         app_commands = {
+            "notepad": "notepad",
+            "open notes": "notepad",
             "open notepad": "notepad",
             "open note pad": "notepad",
+            "start notes": "notepad",
             "start notepad": "notepad",
             "launch notepad": "notepad",
+            "calculator": "calculator",
             "open calculator": "calculator",
             "start calculator": "calculator",
             "launch calculator": "calculator",
@@ -163,22 +170,29 @@ class VoiceWorker(QThread):
                 "voice", "command", "open_application", round(average, 3),
                 {"name": name}))
             return
-        if confidence < COMMAND_MIN_CONFIDENCE:
-            if text in ("right click", "scroll up", "scroll down",
-                        "space", "new line", "next line", "line break",
-                        "pause accessflow", "stop accessflow",
-                        "emergency pause"):
-                self.status.emit(
-                    f"Didn’t catch ‘{text}’ clearly; please repeat the command")
-            return
         if text in ("pause accessflow", "stop accessflow", "emergency pause"):
+            if confidence < COMMAND_MIN_CONFIDENCE:
+                self.status.emit("Pause phrase was unclear; please repeat ‘pause AccessFlow’")
+                return
             event = InteractionEvent("voice", "emergency_pause", "pause", confidence)
-        elif text == "right click":
-            event = InteractionEvent("voice", "command", "click", confidence, {"button": "right"})
-        elif text == "scroll up":
-            event = InteractionEvent("voice", "command", "scroll", confidence, {"amount": 3})
-        elif text == "scroll down":
-            event = InteractionEvent("voice", "command", "scroll", confidence, {"amount": -3})
+        elif text in ("right click", "click right"):
+            if average < CLICK_COMMAND_MIN_CONFIDENCE:
+                self.status.emit("Right-click phrase was unclear; please repeat ‘right click’")
+                return
+            event = InteractionEvent(
+                "voice", "command", "click", round(average, 3), {"button": "right"})
+        elif text in ("scroll up", "scroll upward", "page up"):
+            if average < SCROLL_COMMAND_MIN_CONFIDENCE:
+                self.status.emit("Scroll phrase was unclear; please repeat ‘scroll up’")
+                return
+            event = InteractionEvent(
+                "voice", "command", "scroll", round(average, 3), {"amount": 3})
+        elif text in ("scroll down", "scroll downward", "page down"):
+            if average < SCROLL_COMMAND_MIN_CONFIDENCE:
+                self.status.emit("Scroll phrase was unclear; please repeat ‘scroll down’")
+                return
+            event = InteractionEvent(
+                "voice", "command", "scroll", round(average, 3), {"amount": -3})
         else:
             return
         self.event_ready.emit(event)

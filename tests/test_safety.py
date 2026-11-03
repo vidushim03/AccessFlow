@@ -133,6 +133,11 @@ class EngineTests(unittest.TestCase):
         self.dispatch("voice", "open_application", 0.60, name="notepad")
         self.assertEqual(self.executor.submitted, ["open_application"])
 
+    def test_scroll_uses_voice_command_threshold(self):
+        self.engine.start(["voice"])
+        self.dispatch("voice", "scroll", 0.60, amount=3)
+        self.assertEqual(self.actions.calls, [("scroll", 3)])
+
     def test_disabled_source_is_ignored(self):
         self.engine.start(["head"])
         self.dispatch("voice", "click", 0.99, button="left")
@@ -215,6 +220,26 @@ class VoicePhraseTests(unittest.TestCase):
         self.worker._phrase("next line", 0.78, average=0.78)
         self.assertEqual(self.events[0].action, "press_key")
         self.assertEqual(self.events[0].payload["key"], "enter")
+
+    def test_scroll_command_uses_average_confidence(self):
+        self.worker._phrase("scroll down", 0.35, average=0.68)
+        self.assertEqual(self.events[0].action, "scroll")
+        self.assertEqual(self.events[0].payload["amount"], -3)
+
+    def test_right_click_uses_average_confidence(self):
+        self.worker._phrase("right click", 0.35, average=0.70)
+        self.assertEqual(self.events[0].action, "click")
+        self.assertEqual(self.events[0].payload["button"], "right")
+
+    def test_notepad_name_alone_is_an_allowlisted_launch(self):
+        self.worker._phrase("notepad", 0.72, average=0.72)
+        self.assertEqual(self.events[0].action, "open_application")
+        self.assertEqual(self.events[0].payload["name"], "notepad")
+
+    def test_command_punctuation_is_normalized(self):
+        self.worker._phrase("scroll up.", 0.70, average=0.70)
+        self.assertEqual(self.events[0].action, "scroll")
+        self.assertEqual(self.events[0].payload["amount"], 3)
 
     def test_dictation_preserves_recognized_case(self):
         self.worker._phrase("type Hello World", 0.8, average=0.8)
