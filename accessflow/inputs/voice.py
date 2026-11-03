@@ -17,6 +17,10 @@ MODEL_URL = "https://alphacephei.com/vosk/models/vosk-model-small-en-us-0.15.zip
 COMMAND_MIN_CONFIDENCE = 0.72
 # Dictation is scored on the average word; keeps the two thresholds together.
 DICTATION_MIN_CONFIDENCE = 0.60
+# The app-launch vocabulary is an exact, allow-listed two-phrase command.
+# Average confidence is more reliable than rejecting the phrase for one weak
+# word, while the whitelist still prevents arbitrary program execution.
+OPEN_APP_MIN_CONFIDENCE = 0.60
 # A correct left-click command can have one weakly scored word (often "left")
 # even when the phrase as a whole is clear. Keep an exact-phrase check and use
 # average word confidence, while leaving destructive/open/scroll commands at
@@ -128,7 +132,23 @@ class VoiceWorker(QThread):
                 "voice", "command", "click", round(average, 3),
                 {"button": "left"}))
             return
+        if text in ("open notepad", "open calculator"):
+            if average < OPEN_APP_MIN_CONFIDENCE:
+                self.status.emit(
+                    f"Didn’t catch ‘{text}’ clearly; please repeat the command")
+                return
+            name = text[5:]
+            self.status.emit(f"Opening {name.title()}…")
+            self.event_ready.emit(InteractionEvent(
+                "voice", "command", "open_application", round(average, 3),
+                {"name": name}))
+            return
         if confidence < COMMAND_MIN_CONFIDENCE:
+            if text in ("right click", "scroll up", "scroll down",
+                        "pause accessflow", "stop accessflow",
+                        "emergency pause"):
+                self.status.emit(
+                    f"Didn’t catch ‘{text}’ clearly; please repeat the command")
             return
         if text in ("pause accessflow", "stop accessflow", "emergency pause"):
             event = InteractionEvent("voice", "emergency_pause", "pause", confidence)
@@ -138,8 +158,6 @@ class VoiceWorker(QThread):
             event = InteractionEvent("voice", "command", "scroll", confidence, {"amount": 3})
         elif text == "scroll down":
             event = InteractionEvent("voice", "command", "scroll", confidence, {"amount": -3})
-        elif text in ("open notepad", "open calculator"):
-            event = InteractionEvent("voice", "command", "open_application", confidence, {"name": text[5:]})
         else:
             return
         self.event_ready.emit(event)

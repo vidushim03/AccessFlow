@@ -20,6 +20,7 @@ class InteractionEngine:
         "type_text": 0.60,
         "click": 0.65,
         "click_target": 0.65,
+        "open_application": 0.60,
     }
 
     def __init__(self, actions, minimum_confidence=0.72, on_pause=None,

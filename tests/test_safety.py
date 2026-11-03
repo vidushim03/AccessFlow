@@ -128,6 +128,11 @@ class EngineTests(unittest.TestCase):
         self.dispatch("voice", "click_target", 0.65, button="left", x=20, y=30)
         self.assertEqual(self.executor.submitted, ["click_target"])
 
+    def test_allowlisted_app_launch_uses_voice_threshold(self):
+        self.engine.start(["voice"])
+        self.dispatch("voice", "open_application", 0.60, name="notepad")
+        self.assertEqual(self.executor.submitted, ["open_application"])
+
     def test_disabled_source_is_ignored(self):
         self.engine.start(["head"])
         self.dispatch("voice", "click", 0.99, button="left")
@@ -182,6 +187,18 @@ class VoicePhraseTests(unittest.TestCase):
         self.worker._phrase("left click", 0.9, average=0.64)
         self.assertEqual(self.events, [])
         self.assertTrue(self.statuses)
+
+    def test_open_notepad_uses_average_confidence_and_reports_launch(self):
+        self.worker._phrase("open notepad", 0.45, average=0.72)
+        self.assertEqual(len(self.events), 1)
+        self.assertEqual(self.events[0].action, "open_application")
+        self.assertEqual(self.events[0].payload["name"], "notepad")
+        self.assertIn("Opening Notepad", self.statuses[-1])
+
+    def test_unclear_open_notepad_phrase_reports_that_it_was_not_heard(self):
+        self.worker._phrase("open notepad", 0.45, average=0.50)
+        self.assertEqual(self.events, [])
+        self.assertIn("repeat the command", self.statuses[-1])
 
     def test_dictation_preserves_recognized_case(self):
         self.worker._phrase("type Hello World", 0.8, average=0.8)
