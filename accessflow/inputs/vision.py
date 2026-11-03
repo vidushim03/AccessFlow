@@ -809,8 +809,6 @@ class VisionWorker(QThread):
             ("ring", 13, 14, 16), ("pinky", 17, 18, 20),
         )
         extended = {}
-        alignment_by_finger = {}
-        length_ratio_by_finger = {}
         for name, mcp_index, pip_index, tip_index in finger_joints:
             mcp, pip, tip = points[mcp_index], points[pip_index], points[tip_index]
             proximal = (pip.x - mcp.x, pip.y - mcp.y)
@@ -820,15 +818,11 @@ class VisionWorker(QThread):
             previous = self.hand_finger_extended[name]
             if proximal_length < 1e-4 or distal_length < 1e-4:
                 is_extended = previous
-                alignment_by_finger[name] = None
-                length_ratio_by_finger[name] = None
             else:
                 alignment = ((proximal[0] * distal[0]
                               + proximal[1] * distal[1])
                              / (proximal_length * distal_length))
                 length_ratio = distal_length / proximal_length
-                alignment_by_finger[name] = alignment
-                length_ratio_by_finger[name] = length_ratio
                 threshold = (HAND_FINGER_EXTEND_EXIT_COS if previous else
                              HAND_FINGER_EXTEND_ENTER_COS)
                 is_extended = (alignment >= threshold
@@ -836,23 +830,23 @@ class VisionWorker(QThread):
             self.hand_finger_extended[name] = is_extended
             extended[name] = is_extended
 
-        right_control_fingers_extended = all(
-            alignment_by_finger[name] is not None
-            and length_ratio_by_finger[name] is not None
-            and alignment_by_finger[name] >= HAND_FINGER_EXTEND_ENTER_COS
-            and length_ratio_by_finger[name] >= 0.45
-            for name in ("index", "middle"))
-        # A right click is an intentional V pose: both control fingers are
-        # extended, and both outer fingers show clear curl geometry. Requiring
-        # current-frame evidence avoids stale hysteresis or a mildly bent open
-        # hand turning an ordinary left dwell into a right click.
-        outer_fingers_clearly_curled = all(
-            alignment_by_finger[name] is not None
-            and alignment_by_finger[name] < 0.25
-            for name in ("ring", "pinky"))
-        if right_control_fingers_extended and outer_fingers_clearly_curled:
+        # Retain the earlier, more permissive V-pose rule that worked reliably
+        # for the user's hand. Joint-angle tests rejected valid two-finger
+        # poses when the hand was tilted or the fingertips were foreshortened.
+        wrist = points[0]
+
+        def extended_from_wrist(tip_index, pip_index):
+            tip, pip = points[tip_index], points[pip_index]
+            return math.hypot(tip.x - wrist.x, tip.y - wrist.y) > (
+                math.hypot(pip.x - wrist.x, pip.y - wrist.y) * 1.12)
+
+        index = extended_from_wrist(8, 6)
+        middle = extended_from_wrist(12, 10)
+        ring = extended_from_wrist(16, 14)
+        pinky = extended_from_wrist(20, 18)
+        if index and middle and not ring and not pinky:
             return "two_fingers"
-        if all(extended.values()):
+        if index and middle and ring and pinky:
             return "open"
         return "other"
 
