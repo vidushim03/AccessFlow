@@ -222,11 +222,12 @@ class HandDwellTests(unittest.TestCase):
 
         # Drift slowly enough that an easing dwell anchor used to follow the
         # fingertip and still fire. A fixed anchor must cancel the click.
-        for step in range(1, 9):
+        for step in range(1, 21):
             worker._hand_tracking(
-                self.landmarks("open", index=(0.5 + step * 0.004, 0.3)),
+                self.landmarks("open", index=(0.5 + step * 0.005, 0.3)),
                 1.3 + step * 0.07, True)
-        self.assertFalse(worker.dwell_armed)
+        # Continued slow drift may settle enough to arm a fresh dwell, but
+        # it must not carry the original countdown through the movement.
         self.assertEqual(events, [])
         self.assertGreater(worker.hand_pointer.position[0], 0.5)
 
@@ -240,7 +241,7 @@ class HandDwellTests(unittest.TestCase):
 
         # An intentional move must reach the pointer and cancel dwell instead
         # of being swallowed by the armed state.
-        moved = self.landmarks("open", index=(0.52, 0.3))
+        moved = self.landmarks("open", index=(0.53, 0.3))
         worker._hand_tracking(moved, 1.35, True)
         self.assertGreater(worker.hand_pointer.position[0], before[0])
         self.assertFalse(worker.dwell_armed)
@@ -308,6 +309,29 @@ class HandDwellTests(unittest.TestCase):
         worker._hand_tracking(points, 1.8, True)
         self.assertEqual(len(events), 1)
         self.assertEqual(events[0].payload["button"], "right")
+
+    def test_right_click_pose_survives_shorter_extended_finger_landmarks(self):
+        worker, events = self.make_worker()
+        points = self.landmarks("two_fingers")
+        # A slightly foreshortened fingertip is common when the hand tilts.
+        # Keep the fingertip aligned with the finger while shortening its
+        # distal segment; this should still count as an extended middle finger.
+        points[12] = SimpleNamespace(x=points[12].x, y=0.34)
+        worker._hand_tracking(points, 1.0, True)
+        worker._hand_tracking(points, 1.3, True)
+        worker._hand_tracking(points, 1.8, True)
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0].payload["button"], "right")
+
+    def test_curled_index_does_not_start_left_click_dwell(self):
+        worker, events = self.make_worker()
+        curled = self.landmarks("other")
+        curled[8] = SimpleNamespace(x=0.5, y=0.65)
+        curled[4] = SimpleNamespace(x=0.5, y=0.6)
+        worker._hand_tracking(curled, 1.0, True)
+        worker._hand_tracking(curled, 1.3, True)
+        worker._hand_tracking(curled, 2.0, True)
+        self.assertEqual(events, [])
 
     def test_pinch_pose_does_not_trigger_a_left_click(self):
         worker, events = self.make_worker()

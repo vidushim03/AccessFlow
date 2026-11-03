@@ -166,7 +166,7 @@ POINTER_JUMP_LIMIT = 0.35
 # per-frame step clamp; that heavy low-pass is what keeps a still head from
 # dragging the pointer.
 HEAD_EMA_ALPHA = 0.18
-HAND_DWELL_STABILITY_RADIUS = 0.018
+HAND_DWELL_STABILITY_RADIUS = 0.025
 HAND_FINGER_EXTEND_ENTER_COS = 0.45
 HAND_FINGER_EXTEND_EXIT_COS = 0.20
 
@@ -725,8 +725,9 @@ class VisionWorker(QThread):
 
         # Left click depends only on index-tip stability; the other fingers
         # may be relaxed or curled. Reserve two raised fingers for right click.
-        button = None if self.hand_pinched else (
-            "right" if pose == "two_fingers" else "left")
+        index_extended = self.hand_finger_extended["index"]
+        button = (None if self.hand_pinched or not index_extended else
+                  "right" if pose == "two_fingers" else "left")
         if now < self.dwell_cooldown_until:
             if pointer_active:
                 self.dwell_feedback.emit({"point": (cursor[0] * (self.width - 1),
@@ -827,7 +828,7 @@ class VisionWorker(QThread):
                 threshold = (HAND_FINGER_EXTEND_EXIT_COS if previous else
                              HAND_FINGER_EXTEND_ENTER_COS)
                 is_extended = (alignment >= threshold
-                               and distal_length / proximal_length >= 0.45)
+                               and distal_length / proximal_length >= 0.30)
             self.hand_finger_extended[name] = is_extended
             extended[name] = is_extended
 
