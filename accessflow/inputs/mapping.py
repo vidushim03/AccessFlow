@@ -17,15 +17,13 @@ without a webcam.
 from __future__ import annotations
 
 import math
-from collections import deque
-from statistics import median
 
 import numpy as np
 
 # Keep hand response quick enough to follow slow intentional movement while
 # retaining a modest jitter threshold and per-frame speed cap.
 HAND_SENSITIVITY = 1.8
-HAND_DEAD_ZONE = 0.012
+HAND_DEAD_ZONE = 0.009
 HAND_MAX_DELTA_PX = 220.0
 # Keep the reference fixed below the threshold. This prevents small landmark
 # jitter from accumulating into cursor motion; intended movement accumulates
@@ -139,7 +137,6 @@ class RelativePointer:
         self._ref_y = None
         self._smooth_x = None
         self._smooth_y = None
-        self._samples = deque(maxlen=3)
 
     @property
     def position(self):
@@ -150,7 +147,6 @@ class RelativePointer:
         self._ref_y = None
         self._smooth_x = None
         self._smooth_y = None
-        self._samples.clear()
 
     def reset(self, position=None):
         """Forget the finger reference; optionally move the pointer.
@@ -173,13 +169,6 @@ class RelativePointer:
         y = float(y)
         if not (math.isfinite(x) and math.isfinite(y)):
             return (self._x, self._y)
-        self._samples.append((x, y))
-        # A one-frame MediaPipe landmark spike can otherwise drag a relative
-        # pointer a long way before the next clean frame arrives. A three
-        # sample median drops isolated spikes with only one frame of onset lag.
-        if len(self._samples) == self._samples.maxlen:
-            x = median(sample[0] for sample in self._samples)
-            y = median(sample[1] for sample in self._samples)
         if self._smooth_x is None:
             self._smooth_x = x
             self._smooth_y = y

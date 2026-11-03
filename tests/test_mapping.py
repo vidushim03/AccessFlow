@@ -62,7 +62,6 @@ class RelativePointerTests(unittest.TestCase):
 
     def test_movement_moves_the_pointer(self):
         self.pointer.update(0.40, 0.40)
-        self.pointer.update(0.42, 0.40)
         x, y = self.pointer.update(0.42, 0.40)
         self.assertGreater(x, 0.5)
         self.assertAlmostEqual(y, 0.5, places=6)
@@ -77,14 +76,6 @@ class RelativePointerTests(unittest.TestCase):
                 0.40 + float(rng.normal(0, 0.003)),
                 0.40 + float(rng.normal(0, 0.003)))
         self.assertEqual(position, (0.5, 0.5))
-
-    def test_single_frame_landmark_spike_does_not_drag_pointer(self):
-        for _ in range(5):
-            self.pointer.update(0.40, 0.40)
-        before = self.pointer.position
-        self.pointer.update(0.43, 0.37)
-        self.pointer.update(0.40, 0.40)
-        self.assertEqual(self.pointer.position, before)
 
     def test_slow_deliberate_motion_is_not_swallowed(self):
         self.pointer.update(0.40, 0.40)
@@ -104,7 +95,6 @@ class RelativePointerTests(unittest.TestCase):
         self.assertEqual(self.pointer.update(0.90, 0.90), before)
         self.assertEqual(self.pointer.update(0.90, 0.90), before)
         # Movement after reacquisition continues normally.
-        self.pointer.update(0.92, 0.90)
         self.assertNotEqual(self.pointer.update(0.92, 0.90), before)
 
     def test_fast_glitch_is_clamped(self):
@@ -324,6 +314,19 @@ class HandDwellTests(unittest.TestCase):
         worker._hand_tracking(points, 1.8, True)
         self.assertEqual(len(events), 1)
         self.assertEqual(events[0].action, "click")
+        self.assertEqual(events[0].payload["button"], "right")
+
+    def test_right_click_pose_is_not_blocked_by_index_only_classifier(self):
+        worker, events = self.make_worker()
+        points = self.landmarks("two_fingers")
+        # Keep wrist-relative geometry consistent with the V pose while making
+        # the independent local index-angle classifier disagree (as can happen
+        # with a tilted hand).
+        points[8] = SimpleNamespace(x=0.65, y=0.32)
+        worker._hand_tracking(points, 1.0, True)
+        worker._hand_tracking(points, 1.3, True)
+        worker._hand_tracking(points, 1.8, True)
+        self.assertEqual(len(events), 1)
         self.assertEqual(events[0].payload["button"], "right")
 
     def test_ambiguous_outer_fingers_do_not_turn_left_dwell_into_right(self):

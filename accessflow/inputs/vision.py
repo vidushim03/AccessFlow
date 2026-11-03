@@ -725,8 +725,17 @@ class VisionWorker(QThread):
         # Left click depends only on index-tip stability; the other fingers
         # may be relaxed or curled. Reserve two raised fingers for right click.
         index_extended = self.hand_finger_extended["index"]
-        button = (None if self.hand_pinched or not index_extended else
-                  "right" if pose == "two_fingers" else "left")
+        if self.hand_pinched:
+            button = None
+        elif pose == "two_fingers":
+            # A confirmed V pose is sufficient for right click. Do not gate it
+            # on the independent index-only left-click classifier; hand tilt
+            # can make that classifier disagree with the pose detector.
+            button = "right"
+        elif index_extended:
+            button = "left"
+        else:
+            button = None
         if now < self.dwell_cooldown_until:
             if pointer_active:
                 self.dwell_feedback.emit({"point": (cursor[0] * (self.width - 1),
