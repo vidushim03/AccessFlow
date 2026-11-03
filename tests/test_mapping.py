@@ -310,6 +310,21 @@ class HandDwellTests(unittest.TestCase):
         self.assertEqual(len(events), 1)
         self.assertEqual(events[0].payload["button"], "right")
 
+    def test_ambiguous_outer_fingers_do_not_turn_left_dwell_into_right(self):
+        worker, events = self.make_worker()
+        points = self.landmarks("two_fingers")
+        # The ring and pinky are partly bent, but not clearly curled into a V
+        # pose. They must not trigger right click just because extension
+        # hysteresis classifies them as down.
+        for mcp, pip, tip in ((13, 14, 16), (17, 18, 20)):
+            x = points[pip].x
+            points[tip] = SimpleNamespace(x=x + 0.14, y=0.36)
+        worker._hand_tracking(points, 1.0, True)
+        worker._hand_tracking(points, 1.3, True)
+        worker._hand_tracking(points, 1.8, True)
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0].payload["button"], "left")
+
     def test_right_click_pose_survives_shorter_extended_finger_landmarks(self):
         worker, events = self.make_worker()
         points = self.landmarks("two_fingers")
@@ -322,6 +337,17 @@ class HandDwellTests(unittest.TestCase):
         worker._hand_tracking(points, 1.8, True)
         self.assertEqual(len(events), 1)
         self.assertEqual(events[0].payload["button"], "right")
+
+    def test_open_hand_after_two_finger_pose_returns_to_left(self):
+        worker, events = self.make_worker()
+        two_fingers = self.landmarks("two_fingers")
+        open_hand = self.landmarks("open")
+        worker._hand_tracking(two_fingers, 1.0, True)
+        worker._hand_tracking(open_hand, 1.3, True)
+        worker._hand_tracking(open_hand, 1.8, True)
+        worker._hand_tracking(open_hand, 2.31, True)
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0].payload["button"], "left")
 
     def test_curled_index_does_not_start_left_click_dwell(self):
         worker, events = self.make_worker()

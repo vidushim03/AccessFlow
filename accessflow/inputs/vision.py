@@ -812,6 +812,8 @@ class VisionWorker(QThread):
             ("ring", 13, 14, 16), ("pinky", 17, 18, 20),
         )
         extended = {}
+        alignment_by_finger = {}
+        length_ratio_by_finger = {}
         for name, mcp_index, pip_index, tip_index in finger_joints:
             mcp, pip, tip = points[mcp_index], points[pip_index], points[tip_index]
             proximal = (pip.x - mcp.x, pip.y - mcp.y)
@@ -821,19 +823,32 @@ class VisionWorker(QThread):
             previous = self.hand_finger_extended[name]
             if proximal_length < 1e-4 or distal_length < 1e-4:
                 is_extended = previous
+                alignment_by_finger[name] = None
+                length_ratio_by_finger[name] = None
             else:
                 alignment = ((proximal[0] * distal[0]
                               + proximal[1] * distal[1])
                              / (proximal_length * distal_length))
+                length_ratio = distal_length / proximal_length
+                alignment_by_finger[name] = alignment
+                length_ratio_by_finger[name] = length_ratio
                 threshold = (HAND_FINGER_EXTEND_EXIT_COS if previous else
                              HAND_FINGER_EXTEND_ENTER_COS)
                 is_extended = (alignment >= threshold
-                               and distal_length / proximal_length >= 0.30)
+                               and length_ratio >= 0.30)
             self.hand_finger_extended[name] = is_extended
             extended[name] = is_extended
 
         index_middle = extended["index"] and extended["middle"]
-        if index_middle and not extended["ring"] and not extended["pinky"]:
+        # A right click is an intentional V pose: both control fingers are
+        # extended, and both outer fingers show clear curl geometry. Requiring
+        # current-frame evidence avoids stale hysteresis or a mildly bent open
+        # hand turning an ordinary left dwell into a right click.
+        outer_fingers_clearly_curled = all(
+            alignment_by_finger[name] is not None
+            and alignment_by_finger[name] < 0.10
+            for name in ("ring", "pinky"))
+        if index_middle and outer_fingers_clearly_curled:
             return "two_fingers"
         if all(extended.values()):
             return "open"
