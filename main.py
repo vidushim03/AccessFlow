@@ -1010,7 +1010,7 @@ class AccessFlowWindow(QMainWindow):
         page, box = self._page("Accessibility", "Settings are stored locally on this computer.")
         keyboard = self._card(
             "On-screen keyboard",
-            "Start an input session, open AccessFlow’s keyboard, then dwell on the text field in the app you want to type into and on keyboard keys. The timer shows progress and restarts when Windows identifies a different control. The keyboard stays on top without taking text focus.")
+            "Open AccessFlow’s keyboard, select a text field in the app you want to type into, then click or dwell on keys. The keyboard stays on top without taking text focus, so it also works with the touchpad when camera input is paused.")
         open_keyboard = QPushButton("Open AccessFlow Keyboard")
         open_keyboard.setObjectName("secondaryAction")
         open_keyboard.setMinimumHeight(42)
@@ -1041,15 +1041,12 @@ class AccessFlowWindow(QMainWindow):
             screen.bottom() - keyboard.height() - 24)
         keyboard.show()
         keyboard.raise_()
-        if self.running and not self.engine.paused:
-            self.status_label.setText("AccessFlow keyboard ready · select a text field, then a key")
-        else:
-            self.status_label.setText("Keyboard open · start an input session before typing")
+        self.status_label.setText(
+            "AccessFlow keyboard ready · select a text field, then choose keys")
 
     def _keyboard_key_requested(self, value, is_key):
-        if not self.running or self.engine.paused:
-            self.status_label.setText("Start an input session before typing with this keyboard")
-            return
+        # The on-screen keyboard is also a direct mouse/touchpad input method;
+        # typing must not depend on starting the camera or voice session.
         if is_key:
             self.action_executor.submit(self.actions.press_key, {"key": value})
         else:

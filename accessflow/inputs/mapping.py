@@ -22,9 +22,9 @@ import numpy as np
 
 # Keep hand response quick enough to follow slow intentional movement while
 # retaining a modest jitter threshold and per-frame speed cap.
-HAND_SENSITIVITY = 1.8
-HAND_DEAD_ZONE = 0.012
-HAND_MAX_DELTA_PX = 180.0
+HAND_SENSITIVITY = 2.2
+HAND_DEAD_ZONE = 0.009
+HAND_MAX_DELTA_PX = 220.0
 # Keep the reference fixed below the threshold. This prevents small landmark
 # jitter from accumulating into cursor motion; intended movement accumulates
 # against the reference until it crosses the dead zone.
@@ -34,7 +34,7 @@ HAND_DEAD_ZONE_LEAK = 0.0
 # cutoff lagged behind the finger and swallowed small deliberate movements.
 # A plain EMA has no such threshold, and its steady-state lag under constant
 # motion is only (1-alpha)/alpha of one frame's travel.
-HAND_EMA_ALPHA = 0.65
+HAND_EMA_ALPHA = 0.60
 SCREEN_DWELL_RADIUS_PX = 30.0
 
 # Gaze model versions. The affine model is the shape saved by earlier

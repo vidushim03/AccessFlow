@@ -115,7 +115,7 @@ class CalibrationTests(unittest.TestCase):
         self.w._show_accessflow_keyboard()
         self.assertEqual(
             self.w.status_label.text(),
-            "Keyboard open · start an input session before typing",
+            "AccessFlow keyboard ready · select a text field, then choose keys",
         )
         self.w.accessflow_keyboard.hide()
 
@@ -125,10 +125,34 @@ class CalibrationTests(unittest.TestCase):
         self.w._show_accessflow_keyboard()
         self.assertEqual(
             self.w.status_label.text(),
-            "AccessFlow keyboard ready · select a text field, then a key",
+            "AccessFlow keyboard ready · select a text field, then choose keys",
         )
         self.w.accessflow_keyboard.hide()
         self.w.calibration_overlay = None
+
+    def test_keyboard_types_with_camera_session_paused(self):
+        class RecordingExecutor:
+            def __init__(self):
+                self.submitted = []
+
+            def submit(self, handler, payload):
+                self.submitted.append((handler.__name__, payload))
+
+        executor = RecordingExecutor()
+        original_executor = self.w.action_executor
+        try:
+            self.w.action_executor = executor
+            self.w.running = False
+            self.w.engine.paused = True
+            self.w._keyboard_key_requested("a", False)
+            self.w._keyboard_key_requested("space", True)
+        finally:
+            self.w.action_executor = original_executor
+
+        self.assertEqual(executor.submitted, [
+            ("type_text", {"text": "a"}),
+            ("press_key", {"key": "space"}),
+        ])
 
     def test_stable_point_is_accepted_and_advances(self):
         overlay = self.start_target()

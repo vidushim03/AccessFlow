@@ -166,6 +166,7 @@ POINTER_JUMP_LIMIT = 0.35
 # per-frame step clamp; that heavy low-pass is what keeps a still head from
 # dragging the pointer.
 HEAD_EMA_ALPHA = 0.18
+HAND_DWELL_STABILITY_RADIUS = 0.009
 
 # Standard MediaPipe hand topology, used by the tracking preview to draw the
 # skeleton. Only the preview needs it; detection itself only returns points.
@@ -451,6 +452,19 @@ class VisionWorker(QThread):
         self.pointer_source = None
         self.pointer_output.clear()
         self.pointer_offset.clear()
+        # A dwell started before touchpad takeover must never complete after
+        # camera control resumes at a different cursor position.
+        self.dwell_anchor = None
+        self.dwell_started_at = None
+        self.dwell_candidate_at = None
+        self.dwell_armed = False
+        self.dwell_candidate_button = None
+        self.dwell_locked = False
+        self.dwell_lock_anchor = None
+        self.dwell_cooldown_until = 0.0
+        self.hand_dwell_target = None
+        self.hand_pinched = False
+        self.screen_dwell.reset()
         # Resume the relative hand pointer where the real cursor is, so the
         # first hand movement after a touchpad takeover continues from there.
         if self.preview:
@@ -645,11 +659,11 @@ class VisionWorker(QThread):
             else:
                 cursor = self.hand_pointer.position
                 return cursor, "Move away to re-arm clicking"
-        # Freeze pointer output while a dwell timer is active. Otherwise the
-        # movement used to stabilize a noisy finger can keep displacing the
-        # desktop cursor while the user is trying to select a target.
+        # Keep mapping the fingertip during dwell. Freezing output made hand
+        # control appear to stop as soon as the timer armed. Dwell is canceled
+        # below if the fingertip moves beyond its fixed stability anchor.
         cursor = self.hand_pointer.position
-        if not self.dwell_armed and not self.dwell_locked:
+        if not self.dwell_locked:
             cursor = self.hand_pointer.update(index_tip.x, index_tip.y)
         target = None
         if pointer_active:
@@ -669,12 +683,19 @@ class VisionWorker(QThread):
             self.dwell_anchor = current
             self.dwell_started_at = now
         elif math.hypot(current[0] - self.dwell_anchor[0],
-                        current[1] - self.dwell_anchor[1]) > 0.012:
+                        current[1] - self.dwell_anchor[1]) > HAND_DWELL_STABILITY_RADIUS:
+            # Before arming, any movement restarts the stability interval. Once
+            # armed, the anchor stays fixed for the full dwell duration; easing
+            # it toward the finger let slow motion continue unnoticed and could
+            # trigger a click at a location the user had already left.
             self.dwell_anchor = current
-            self.dwell_started_at = now
-        else:
-            self.dwell_anchor = (0.8 * self.dwell_anchor[0] + 0.2 * current[0],
-                                 0.8 * self.dwell_anchor[1] + 0.2 * current[1])
+            if self.dwell_armed:
+                self.dwell_armed = False
+                self.dwell_candidate_button = None
+                self.dwell_candidate_at = None
+                self.dwell_started_at = None
+            elif self.dwell_candidate_button is not None:
+                self.dwell_candidate_at = now
 
         # Left click depends only on index-tip stability; the other fingers
         # may be relaxed or curled. Reserve two raised fingers for right click.
@@ -704,7 +725,7 @@ class VisionWorker(QThread):
                 self.dwell_anchor = current
             elif self.dwell_armed:
                 if math.hypot(current[0] - self.dwell_anchor[0],
-                              current[1] - self.dwell_anchor[1]) > 0.012:
+                              current[1] - self.dwell_anchor[1]) > HAND_DWELL_STABILITY_RADIUS:
                     self.dwell_armed = False
                     self.dwell_candidate_button = None
                     self.dwell_candidate_at = None
@@ -878,8 +899,7 @@ class VisionWorker(QThread):
                             if not self.preview:
                                 self.pointer_source = "gestures"
                                 self.pointer_last = cursor
-                                if (not self.dwell_locked
-                                        and not self.dwell_armed):
+                                if not self.dwell_locked:
                                     self.event_ready.emit(InteractionEvent(
                                         "gestures", "pointer", "move_pointer", 0.86, {
                                             "x": int(cursor[0] * (self.width - 1)),

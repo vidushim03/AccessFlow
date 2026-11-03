@@ -23,7 +23,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import numpy as np
 
 from accessflow.inputs.mapping import (
-    GAZE_MODEL_AFFINE, GAZE_MODEL_QUADRATIC, DwellSelector, RelativePointer,
+    GAZE_MODEL_AFFINE, GAZE_MODEL_QUADRATIC, HAND_MAX_DELTA_PX,
+    DwellSelector, RelativePointer,
     apply_gaze_mapping, fit_best_gaze_mapping, fit_gaze_mapping,
     gaze_vector, valid_gaze_matrix,
 )
@@ -100,7 +101,8 @@ class RelativePointerTests(unittest.TestCase):
         self.pointer.update(0.40, 0.40)
         x, _ = self.pointer.update(0.90, 0.40)
         # A landmark glitch must not move the cursor more than the 180 px cap.
-        self.assertAlmostEqual(x, 0.5 + 180 / 1920, places=6)
+        self.assertAlmostEqual(
+            x, 0.5 + HAND_MAX_DELTA_PX / 1920, places=6)
 
     def test_reset_can_move_to_the_real_cursor(self):
         self.pointer.update(0.40, 0.40)
@@ -170,6 +172,38 @@ class HandDwellTests(unittest.TestCase):
         worker._hand_tracking(curled, 3.4, True)
         self.assertFalse(worker.dwell_locked)
         self.assertEqual(len(events), 1)
+
+    def test_slow_finger_motion_cancels_an_armed_click(self):
+        worker, events = self.make_worker(dwell_ms=500)
+        worker._hand_tracking(self.landmarks("open"), 1.0, True)
+        worker._hand_tracking(self.landmarks("open"), 1.3, True)
+        self.assertTrue(worker.dwell_armed)
+
+        # Drift slowly enough that an easing dwell anchor used to follow the
+        # fingertip and still fire. A fixed anchor must cancel the click.
+        for step in range(1, 9):
+            worker._hand_tracking(
+                self.landmarks("open", index=(0.5 + step * 0.002, 0.3)),
+                1.3 + step * 0.07, True)
+        self.assertFalse(worker.dwell_armed)
+        self.assertEqual(events, [])
+        self.assertGreater(worker.hand_pointer.position[0], 0.5)
+
+    def test_hand_pointer_keeps_moving_while_dwell_is_armed(self):
+        worker, events = self.make_worker(dwell_ms=1000)
+        still = self.landmarks("open")
+        worker._hand_tracking(still, 1.0, True)
+        worker._hand_tracking(still, 1.3, True)
+        self.assertTrue(worker.dwell_armed)
+        before = worker.hand_pointer.position
+
+        # An intentional move must reach the pointer and cancel dwell instead
+        # of being swallowed by the armed state.
+        moved = self.landmarks("open", index=(0.52, 0.3))
+        worker._hand_tracking(moved, 1.35, True)
+        self.assertGreater(worker.hand_pointer.position[0], before[0])
+        self.assertFalse(worker.dwell_armed)
+        self.assertEqual(events, [])
 
     def test_hand_dwell_restarts_when_accessible_control_changes(self):
         worker, events = self.make_worker()
