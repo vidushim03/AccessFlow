@@ -143,12 +143,21 @@ class VoiceWorker(QThread):
                 "voice", "command", "press_key", round(average, 3),
                 {"key": key}))
             return
-        if text in ("open notepad", "open calculator"):
+        app_commands = {
+            "open notepad": "notepad",
+            "open note pad": "notepad",
+            "start notepad": "notepad",
+            "launch notepad": "notepad",
+            "open calculator": "calculator",
+            "start calculator": "calculator",
+            "launch calculator": "calculator",
+        }
+        if text in app_commands:
             if average < OPEN_APP_MIN_CONFIDENCE:
                 self.status.emit(
                     f"Didn’t catch ‘{text}’ clearly; please repeat the command")
                 return
-            name = text[5:]
+            name = app_commands[text]
             self.status.emit(f"Opening {name.title()}…")
             self.event_ready.emit(InteractionEvent(
                 "voice", "command", "open_application", round(average, 3),

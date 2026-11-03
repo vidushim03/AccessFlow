@@ -195,6 +195,12 @@ class VoicePhraseTests(unittest.TestCase):
         self.assertEqual(self.events[0].payload["name"], "notepad")
         self.assertIn("Opening Notepad", self.statuses[-1])
 
+    def test_open_note_pad_transcription_launches_notepad(self):
+        self.worker._phrase("open note pad", 0.62, average=0.70)
+        self.assertEqual(len(self.events), 1)
+        self.assertEqual(self.events[0].action, "open_application")
+        self.assertEqual(self.events[0].payload["name"], "notepad")
+
     def test_unclear_open_notepad_phrase_reports_that_it_was_not_heard(self):
         self.worker._phrase("open notepad", 0.45, average=0.50)
         self.assertEqual(self.events, [])
