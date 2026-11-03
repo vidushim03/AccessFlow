@@ -20,23 +20,22 @@ import math
 
 import numpy as np
 
-# Hand pointer tuning, ported from the reference gesture_os project. The
-# numbers were hand-tuned there: 2.5x finger travel feels like a trackpad,
-# 0.008 of the frame (~5 px at 640 wide) is below tremor, and 300 px per
-# frame stops a landmark glitch from throwing the pointer across the screen.
-HAND_SENSITIVITY = 2.5
-HAND_DEAD_ZONE = 0.008
-HAND_MAX_DELTA_PX = 300.0
-# While the finger is inside the dead zone the reference drifts toward it by
-# this fraction each frame. Sustained slow movement still builds up and moves
-# the pointer, but random landmark jitter does not accumulate into drift.
-HAND_DEAD_ZONE_LEAK = 0.15
+# Keep hand response quick enough to follow slow intentional movement while
+# retaining a modest jitter threshold and per-frame speed cap.
+HAND_SENSITIVITY = 1.8
+HAND_DEAD_ZONE = 0.012
+HAND_MAX_DELTA_PX = 180.0
+# Keep the reference fixed below the threshold. This prevents small landmark
+# jitter from accumulating into cursor motion; intended movement accumulates
+# against the reference until it crosses the dead zone.
+HAND_DEAD_ZONE_LEAK = 0.0
 # A light EMA on the fingertip halves landmark jitter before the dead zone sees
 # it. It is deliberately not the One Euro filter: that filter's slow minimum
 # cutoff lagged behind the finger and swallowed small deliberate movements.
 # A plain EMA has no such threshold, and its steady-state lag under constant
 # motion is only (1-alpha)/alpha of one frame's travel.
-HAND_EMA_ALPHA = 0.5
+HAND_EMA_ALPHA = 0.65
+SCREEN_DWELL_RADIUS_PX = 30.0
 
 # Gaze model versions. The affine model is the shape saved by earlier
 # versions; it is still accepted so an existing calibration is not thrown
@@ -49,6 +48,68 @@ GAZE_AFFINE_FEATURES = 3
 
 def clamp01(value):
     return max(0.0, min(1.0, float(value)))
+
+
+class DwellSelector:
+    """One-shot left-click dwell for an absolute screen pointer and target.
+
+    When a UI control identity is available, changing controls restarts dwell.
+    Otherwise the selector uses a small spatial radius. It fires once and
+    rearms only after the pointer leaves the target/radius.
+    """
+
+    def __init__(self, duration_ms=1200, radius_px=SCREEN_DWELL_RADIUS_PX,
+                 dropout_reset_s=0.25):
+        self.duration_ms = max(250, int(duration_ms))
+        self.radius_px = max(1.0, float(radius_px))
+        self.dropout_reset_s = max(0.0, float(dropout_reset_s))
+        self.reset()
+
+    def reset(self):
+        self.source = None
+        self.target = None
+        self.anchor = None
+        self.started_at = None
+        self.last_update = None
+        self.fired = False
+
+    def update(self, point, now, source, enabled=True, target=None):
+        """Return ``(progress, clicked)`` for a pixel-space pointer sample."""
+        if not enabled:
+            self.reset()
+            return 0.0, False
+        x, y = float(point[0]), float(point[1])
+        if not (math.isfinite(x) and math.isfinite(y)):
+            self.reset()
+            return 0.0, False
+        now = float(now)
+        if (self.source != source
+                or (self.last_update is not None
+                    and now - self.last_update > self.dropout_reset_s)
+                or (self.anchor is not None and target != self.target)):
+            self.reset()
+        if self.anchor is None:
+            self.source = source
+            self.target = target
+            self.anchor = (x, y)
+            self.started_at = now
+            self.last_update = now
+            return 0.0, False
+
+        if math.hypot(x - self.anchor[0], y - self.anchor[1]) > self.radius_px:
+            self.anchor = (x, y)
+            self.started_at = now
+            self.fired = False
+        self.target = target
+        self.last_update = now
+        if self.fired:
+            return 1.0, False
+        progress = max(0.0, min(1.0,
+                                (now - self.started_at) * 1000.0 / self.duration_ms))
+        if progress >= 1.0:
+            self.fired = True
+            return 1.0, True
+        return progress, False
 
 
 class RelativePointer:
@@ -128,9 +189,10 @@ class RelativePointer:
         dy = float(y) - self._ref_y
         distance = math.hypot(dx, dy)
         if distance < self.dead_zone:
-            # Inside the dead zone: do not move, but let the reference follow
-            # slowly. A constant slow motion therefore still accumulates,
-            # while zero-mean jitter is damped instead of random-walking.
+            # Inside the dead zone: keep the reference fixed. Slow deliberate
+            # movement accumulates against it and eventually crosses the zone;
+            # following the reference here turns symmetric landmark noise into
+            # a random walk across the screen.
             self._ref_x += dx * self.dead_zone_leak
             self._ref_y += dy * self.dead_zone_leak
             return (self._x, self._y)
@@ -182,6 +244,12 @@ def fit_gaze_mapping(features, targets, model=GAZE_MODEL_QUADRATIC):
     """
     feature_rows = np.asarray(features, dtype=float)
     target_rows = np.asarray(targets, dtype=float)
+    if (feature_rows.ndim != 2 or feature_rows.shape[1:] != (2,)
+            or target_rows.ndim != 2 or target_rows.shape[1:] != (2,)):
+        raise ValueError("Gaze features and targets must be 2D points.")
+    if not (np.all(np.isfinite(feature_rows))
+            and np.all(np.isfinite(target_rows))):
+        raise ValueError("Gaze calibration contains non-finite readings.")
     if feature_rows.shape[0] != target_rows.shape[0] or feature_rows.shape[0] < 3:
         raise ValueError("Not enough calibration points.")
     design = np.stack([gaze_vector(fx, fy, model) for fx, fy in feature_rows])
@@ -211,6 +279,72 @@ def fit_gaze_mapping(features, targets, model=GAZE_MODEL_QUADRATIC):
     else:
         error = float(np.sqrt(np.mean((design @ matrix - target_rows) ** 2)))
     return matrix, error
+
+
+def leave_one_out_gaze_predictions(features, targets, model):
+    """Return each held-out target prediction for calibration diagnostics.
+
+    A ``None`` prediction means the remaining calibration points could not
+    identify a full-rank model for that fold.
+    """
+    feature_rows = np.asarray(features, dtype=float)
+    target_rows = np.asarray(targets, dtype=float)
+    if (feature_rows.ndim != 2 or feature_rows.shape[1:] != (2,)
+            or target_rows.ndim != 2 or target_rows.shape[1:] != (2,)):
+        raise ValueError("Gaze features and targets must be 2D points.")
+    if not (np.all(np.isfinite(feature_rows))
+            and np.all(np.isfinite(target_rows))):
+        raise ValueError("Gaze calibration contains non-finite readings.")
+    if feature_rows.shape[0] != target_rows.shape[0]:
+        raise ValueError("Feature and target counts do not match.")
+    design = np.stack([gaze_vector(fx, fy, model) for fx, fy in feature_rows])
+    predictions = []
+    for index in range(len(feature_rows)):
+        keep = np.arange(len(feature_rows)) != index
+        fold_design = design[keep]
+        if np.linalg.matrix_rank(fold_design) < design.shape[1]:
+            predictions.append(None)
+            continue
+        fold_matrix, _, _, _ = np.linalg.lstsq(
+            fold_design, target_rows[keep], rcond=None)
+        predictions.append(design[index] @ fold_matrix)
+    return predictions
+
+
+def fit_best_gaze_mapping(features, targets, quadratic_improvement=0.005):
+    """Choose the simplest gaze model whose held-out fit is adequate.
+
+    Nine calibration points provide much less evidence for a six-parameter
+    quadratic than for a three-parameter affine mapping. Start with affine and
+    use quadratic only when leave-one-out validation improves by at least
+    ``quadratic_improvement`` of normalized screen space. This avoids selecting
+    a more flexible model for a negligible change while retaining it when the
+    eye response is meaningfully curved.
+
+    Returns ``(matrix, error, model, errors)``; ``errors`` contains the
+    cross-validation score for each model that could be fitted.
+    """
+    errors = {}
+    matrices = {}
+    for model in (GAZE_MODEL_AFFINE, GAZE_MODEL_QUADRATIC):
+        try:
+            matrices[model], errors[model] = fit_gaze_mapping(
+                features, targets, model)
+        except ValueError:
+            continue
+    if not matrices:
+        raise ValueError("Eye movement was too small to fit a gaze mapping.")
+
+    affine_error = errors.get(GAZE_MODEL_AFFINE, float("inf"))
+    quadratic_error = errors.get(GAZE_MODEL_QUADRATIC, float("inf"))
+    if (GAZE_MODEL_QUADRATIC in matrices
+            and affine_error - quadratic_error >= quadratic_improvement):
+        chosen = GAZE_MODEL_QUADRATIC
+    elif GAZE_MODEL_AFFINE in matrices:
+        chosen = GAZE_MODEL_AFFINE
+    else:
+        chosen = GAZE_MODEL_QUADRATIC
+    return matrices[chosen], errors[chosen], chosen, errors
 
 
 def apply_gaze_mapping(matrix, x, y):

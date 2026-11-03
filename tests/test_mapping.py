@@ -16,16 +16,18 @@ from __future__ import annotations
 import sys
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import numpy as np
 
 from accessflow.inputs.mapping import (
-    GAZE_MODEL_QUADRATIC, RelativePointer, apply_gaze_mapping,
-    fit_gaze_mapping, gaze_vector, valid_gaze_matrix,
+    GAZE_MODEL_AFFINE, GAZE_MODEL_QUADRATIC, DwellSelector, RelativePointer,
+    apply_gaze_mapping, fit_best_gaze_mapping, fit_gaze_mapping,
+    gaze_vector, valid_gaze_matrix,
 )
-from accessflow.inputs.vision import HEAD_NEUTRAL_SAMPLES, HeadTracker
+from accessflow.inputs.vision import HEAD_NEUTRAL_SAMPLES, HeadTracker, VisionWorker
 
 TARGETS = [(0.12, 0.12), (0.5, 0.12), (0.88, 0.12), (0.12, 0.5),
            (0.5, 0.5), (0.88, 0.5), (0.12, 0.88), (0.5, 0.88), (0.88, 0.88)]
@@ -97,8 +99,8 @@ class RelativePointerTests(unittest.TestCase):
     def test_fast_glitch_is_clamped(self):
         self.pointer.update(0.40, 0.40)
         x, _ = self.pointer.update(0.90, 0.40)
-        # 0.5 * 1920 * 2.5 would be 2400 px; the clamp caps it at 300 px.
-        self.assertAlmostEqual(x, 0.5 + 300 / 1920, places=6)
+        # A landmark glitch must not move the cursor more than the 180 px cap.
+        self.assertAlmostEqual(x, 0.5 + 180 / 1920, places=6)
 
     def test_reset_can_move_to_the_real_cursor(self):
         self.pointer.update(0.40, 0.40)
@@ -106,6 +108,119 @@ class RelativePointerTests(unittest.TestCase):
         self.assertEqual(self.pointer.position, (0.8, 0.2))
         # The first sample after a reset only re-anchors.
         self.assertEqual(self.pointer.update(0.1, 0.1), (0.8, 0.2))
+
+
+class DwellSelectorTests(unittest.TestCase):
+    def test_target_change_restarts_dwell_even_at_same_position(self):
+        dwell = DwellSelector(duration_ms=1000, radius_px=30)
+        self.assertEqual(dwell.update((100, 100), 0.0, "head", target="button-a"), (0.0, False))
+        progress, clicked = dwell.update((100, 100), 0.2, "head", target="button-b")
+        self.assertFalse(clicked)
+        self.assertEqual(progress, 0.0)
+        progress, clicked = dwell.update((100, 100), 0.4, "head", target="button-b")
+        self.assertFalse(clicked)
+        self.assertAlmostEqual(progress, 0.2)
+
+    def test_same_target_completes_dwell(self):
+        dwell = DwellSelector(duration_ms=500, radius_px=30)
+        dwell.update((100, 100), 0.0, "gaze", target="menu-item")
+        dwell.update((100, 100), 0.2, "gaze", target="menu-item")
+        dwell.update((100, 100), 0.4, "gaze", target="menu-item")
+        progress, clicked = dwell.update((100, 100), 0.5, "gaze", target="menu-item")
+        self.assertEqual(progress, 1.0)
+        self.assertTrue(clicked)
+
+
+class HandDwellTests(unittest.TestCase):
+    @staticmethod
+    def landmarks(pose="open", index=(0.5, 0.3), pinch=False):
+        points = [SimpleNamespace(x=0.5, y=0.6) for _ in range(21)]
+        points[0] = SimpleNamespace(x=0.5, y=0.8)
+        for tip, pip in ((8, 6), (12, 10), (16, 14), (20, 18)):
+            up = pose == "open" or (pose == "two_fingers" and tip in (8, 12))
+            points[pip] = SimpleNamespace(x=0.5, y=0.4 if up else 0.65)
+            points[tip] = SimpleNamespace(x=0.5, y=0.2 if up else 0.68)
+        points[8] = SimpleNamespace(x=index[0], y=index[1])
+        points[4] = (SimpleNamespace(x=index[0], y=index[1]) if pinch else
+                     SimpleNamespace(x=0.5, y=0.6))
+        return points
+
+    def make_worker(self, dwell_ms=500):
+        worker = VisionWorker(1920, 1080, False, True,
+                              preview="hand", dwell_ms=dwell_ms)
+        events = []
+        worker.event_ready.connect(events.append)
+        worker.preview = None
+        return worker, events
+
+    def test_left_dwell_clicks_once_and_requires_move_away(self):
+        worker, events = self.make_worker()
+        points = self.landmarks("open")
+        worker._hand_tracking(points, 1.0, True)
+        worker._hand_tracking(points, 1.3, True)  # pose debounce arms dwell
+        worker._hand_tracking(points, 1.8, True)  # completes selected 500 ms
+        self.assertEqual(len(events), 1)
+
+        worker._hand_tracking(points, 2.2, True)
+        worker._hand_tracking(points, 2.7, True)
+        self.assertEqual(len(events), 1)
+
+        curled = self.landmarks("other", index=(0.5, 0.37))
+        worker._hand_tracking(curled, 2.8, True)  # release and move away
+        worker._hand_tracking(curled, 3.4, True)
+        self.assertFalse(worker.dwell_locked)
+        self.assertEqual(len(events), 1)
+
+    def test_hand_dwell_restarts_when_accessible_control_changes(self):
+        worker, events = self.make_worker()
+
+        class FakeTargetMonitor:
+            current = "button-a"
+
+            def set_point(self, point):
+                pass
+
+            def target(self):
+                return self.current
+
+        monitor = FakeTargetMonitor()
+        worker.target_monitor = monitor
+        points = self.landmarks("open")
+        worker._hand_tracking(points, 1.0, True)
+        worker._hand_tracking(points, 1.3, True)
+        monitor.current = "button-b"
+        worker._hand_tracking(points, 1.6, True)
+        worker._hand_tracking(points, 1.9, True)
+        self.assertEqual(events, [])
+        worker._hand_tracking(points, 2.4, True)
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0].payload["button"], "left")
+
+    def test_two_finger_pose_selects_right_click(self):
+        worker, events = self.make_worker()
+        points = self.landmarks("two_fingers")
+        worker._hand_tracking(points, 1.0, True)
+        worker._hand_tracking(points, 1.3, True)
+        worker._hand_tracking(points, 1.8, True)
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0].payload["button"], "right")
+
+    def test_pinch_pose_does_not_trigger_a_left_click(self):
+        worker, events = self.make_worker()
+        open_hand = self.landmarks("open")
+        worker._hand_tracking(open_hand, 1.0, True)
+        worker._hand_tracking(open_hand, 1.3, True)
+        self.assertTrue(worker.dwell_armed)
+
+        pinched = self.landmarks("open", pinch=True)
+        worker._hand_tracking(pinched, 1.4, True)
+        worker._hand_tracking(pinched, 2.0, True)
+        self.assertTrue(worker.hand_pinched)
+        self.assertEqual(events, [])
+        self.assertFalse(worker.dwell_armed)
+
+        worker._hand_tracking(open_hand, 2.1, True)
+        self.assertFalse(worker.hand_pinched)
 
 
 class HeadTrackerTests(unittest.TestCase):
@@ -205,6 +320,12 @@ class GazeMappingTests(unittest.TestCase):
         self.features = features
         self.targets = targets
 
+    def test_non_finite_calibration_samples_are_rejected(self):
+        features = list(self.features)
+        features[3] = (float("nan"), features[3][1])
+        with self.assertRaisesRegex(ValueError, "non-finite"):
+            fit_gaze_mapping(features, self.targets)
+
     def test_quadratic_fit_recovers_a_curved_eye(self):
         matrix, error = fit_gaze_mapping(self.features, self.targets)
         self.assertEqual(matrix.shape, (6, 2))
@@ -212,6 +333,26 @@ class GazeMappingTests(unittest.TestCase):
         for (fx, fy), target in zip(self.features, self.targets):
             self.assertTrue(np.allclose(
                 apply_gaze_mapping(matrix, fx, fy), target, atol=1e-6))
+
+    def test_model_selection_prefers_affine_for_negligible_quadratic_gain(self):
+        matrix, error, model, errors = fit_best_gaze_mapping(
+            self.features, self.targets)
+        self.assertEqual(model, GAZE_MODEL_AFFINE)
+        self.assertEqual(matrix.shape, (3, 2))
+        self.assertLessEqual(
+            error, errors[GAZE_MODEL_QUADRATIC] + 0.005)
+        self.assertIn(GAZE_MODEL_QUADRATIC, errors)
+
+    def test_model_selection_uses_quadratic_for_meaningful_curvature(self):
+        features = [(x, y) for y in (0.2, 0.5, 0.8)
+                    for x in (0.2, 0.5, 0.8)]
+        targets = [(0.15 + 0.55 * x + 0.4 * x * x,
+                    0.15 + 0.55 * y + 0.4 * y * y)
+                   for x, y in features]
+        matrix, error, model, errors = fit_best_gaze_mapping(features, targets)
+        self.assertEqual(model, GAZE_MODEL_QUADRATIC)
+        self.assertEqual(matrix.shape, (6, 2))
+        self.assertLess(error, errors[GAZE_MODEL_AFFINE])
 
     def test_random_calibration_is_rejected_by_held_out_error(self):
         features = [(float(self.rng.uniform(0, 1)),

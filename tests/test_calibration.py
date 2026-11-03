@@ -108,14 +108,38 @@ class CalibrationTests(unittest.TestCase):
         self.w._poll_calibration()
         self.assertNotIn(0, self.w.calibration_points)
         self.assertEqual(self.w.calibration_target_index, 0)
-        self.assertIsNotNone(self.w.calibration_overlay)
+
+    def test_keyboard_status_reflects_paused_input_session(self):
+        self.w.running = False
+        self.w.engine.paused = True
+        self.w._show_accessflow_keyboard()
+        self.assertEqual(
+            self.w.status_label.text(),
+            "Keyboard open · start an input session before typing",
+        )
+        self.w.accessflow_keyboard.hide()
+
+    def test_keyboard_ready_status_requires_active_unpaused_session(self):
+        self.w.running = True
+        self.w.engine.paused = False
+        self.w._show_accessflow_keyboard()
+        self.assertEqual(
+            self.w.status_label.text(),
+            "AccessFlow keyboard ready · select a text field, then a key",
+        )
+        self.w.accessflow_keyboard.hide()
+        self.w.calibration_overlay = None
 
     def test_stable_point_is_accepted_and_advances(self):
         overlay = self.start_target()
+        self.w.calibration_buffer.extend([(0.42, 0.31)] * m.CALIBRATION_MIN_SAMPLES)
         for _ in range(20):
             self.w.calibration_buffer.append(
                 (0.42 + float(self.rng.normal(0, 0.002)),
                  0.31 + float(self.rng.normal(0, 0.002))))
+        self.w._poll_calibration()
+        self.assertNotIn(0, self.w.calibration_points)
+        self.w.calibration_target_started -= m.CALIBRATION_MIN_DWELL
         self.w._poll_calibration()
         self.assertIn(0, self.w.calibration_points)
         self.assertEqual(self.w.calibration_target_index, 1)
@@ -123,10 +147,12 @@ class CalibrationTests(unittest.TestCase):
 
     def test_realistic_still_eye_jitter_is_accepted(self):
         # A still eye still has microsaccadic/landmark jitter (~0.05 std of the
-        # iris-in-eye feature). At the 0.10 tolerance this must be accepted so a
+        # iris-in-eye feature). At the 0.07 tolerance this must be accepted so a
         # genuinely still user can finish the nine-point calibration instead of
         # timing out on the first dot.
         overlay = self.start_target()
+        self.w.calibration_target_started -= m.CALIBRATION_MIN_DWELL
+        self.w.calibration_buffer.extend([(0.42, 0.31)] * m.CALIBRATION_MIN_SAMPLES)
         for _ in range(20):
             self.w.calibration_buffer.append(
                 (0.42 + float(self.rng.normal(0, 0.05)),
@@ -137,7 +163,7 @@ class CalibrationTests(unittest.TestCase):
 
     def test_unsteady_eye_is_still_rejected_after_loosening(self):
         # Deliberate eye movement between targets moves the feature by ~0.2+,
-        # so even at the loosened 0.10 tolerance an unsteady eye is rejected.
+        # so it exceeds the research-aligned 0.07 stability tolerance.
         self.start_target()
         for _ in range(20):
             self.w.calibration_buffer.append(
@@ -149,15 +175,17 @@ class CalibrationTests(unittest.TestCase):
 
     def test_transition_frames_are_discarded(self):
         self.start_target()
+        self.w.calibration_buffer.clear()
         self.w.calibration_target_started = time.monotonic()
         self.w._collect_gaze_sample((0.9, 0.9))
         self.assertEqual(len(self.w.calibration_buffer), 0)
 
     def test_starvation_times_out_instead_of_stalling(self):
         self.start_target()
+        self.w.calibration_buffer.clear()
         self.w.calibration_target_started = time.monotonic() - m.CALIBRATION_POINT_TIMEOUT - 1
         self.w._poll_calibration()
-        self.assertIn("no steady eye reading", self.w.calibration_status.text)
+        self.assertIn("not enough valid eye readings", self.w.calibration_status.text)
         self.assertIsNone(self.w.calibration_overlay)
 
     def test_clean_fit_is_saved_with_screen_size(self):
@@ -168,13 +196,13 @@ class CalibrationTests(unittest.TestCase):
 
         self.assertIsNotNone(self.w.gaze_transform)
         matrix = np.asarray(self.w.gaze_transform)
-        self.assertEqual(matrix.shape, (6, 2))
+        self.assertEqual(matrix.shape, (3, 2))
         for (fx, fy), target in zip(features, targets):
             mapped = apply_gaze_mapping(matrix, fx, fy)
             self.assertTrue(np.allclose(mapped, target, atol=1e-6))
         saved = json.loads(self.w.settings.value(m.CALIBRATION_KEY, ""))
         self.assertEqual(saved["feature"], m.GAZE_FEATURE)
-        self.assertEqual(saved["model"], GAZE_MODEL_QUADRATIC)
+        self.assertEqual(saved["model"], m.GAZE_MODEL_AFFINE)
         self.assertEqual(saved["screen"], list(self.w.actions.screen_size()))
 
     def test_failed_recalibration_keeps_the_working_one(self):
@@ -228,6 +256,16 @@ class CalibrationTests(unittest.TestCase):
         }))
         loaded = self.w._load_calibration()
         self.assertEqual(loaded, [[0.5, 0.1], [0.2, 0.4], [0.1, 0.1]])
+
+    def test_mapping_with_model_shape_mismatch_is_refused(self):
+        self.w.settings.setValue(m.CALIBRATION_KEY, json.dumps({
+            "feature": m.GAZE_FEATURE,
+            "model": GAZE_MODEL_QUADRATIC,
+            "screen": list(self.w.actions.screen_size()),
+            "matrix": [[0.5, 0.1], [0.2, 0.4], [0.1, 0.1]],
+        }))
+        self.assertIsNone(self.w._load_calibration())
+        self.assertIn("inconsistent", self.w.calibration_notice)
 
     def test_legacy_mapping_still_loads_with_a_notice(self):
         self.w.settings.setValue("gaze/transform_v3", json.dumps(

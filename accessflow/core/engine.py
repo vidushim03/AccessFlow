@@ -9,13 +9,18 @@ class InteractionEngine:
     # Actions that can block for seconds (typing, UI automation) are handed to
     # the action thread so they never freeze the interface or delay pause.
     DEFERRED_ACTIONS = frozenset({
-        "type_text", "press_key", "open_application", "activate_window", "click_control",
+        "type_text", "press_key", "open_application", "activate_window",
+        "click_control", "click_target",
     })
 
     # Free dictation is text the user can see and correct, so it tolerates a
     # lower score than a command that moves or clicks something. Matches the
     # voice worker's dictation threshold.
-    ACTION_CONFIDENCE = {"type_text": 0.60}
+    ACTION_CONFIDENCE = {
+        "type_text": 0.60,
+        "click": 0.65,
+        "click_target": 0.65,
+    }
 
     def __init__(self, actions, minimum_confidence=0.72, on_pause=None,
                  on_error=None, executor=None):
@@ -62,17 +67,19 @@ class InteractionEngine:
         threshold = self.ACTION_CONFIDENCE.get(event.action, self.minimum_confidence)
         if not 0.0 <= event.confidence <= 1.0 or event.confidence < threshold:
             return False
-        handlers = {
-            "move_pointer": self.actions.move_pointer,
-            "click": self.actions.click,
-            "scroll": self.actions.scroll,
-            "type_text": self.actions.type_text,
-            "press_key": self.actions.press_key,
-            "open_application": self.actions.open_application,
-            "activate_window": self.actions.activate_window,
-            "click_control": self.actions.click_control,
+        handler_names = {
+            "move_pointer": "move_pointer",
+            "click": "click",
+            "click_target": "click_target",
+            "scroll": "scroll",
+            "type_text": "type_text",
+            "press_key": "press_key",
+            "open_application": "open_application",
+            "activate_window": "activate_window",
+            "click_control": "click_control",
         }
-        handler = handlers.get(event.action)
+        handler_name = handler_names.get(event.action)
+        handler = getattr(self.actions, handler_name, None) if handler_name else None
         if not handler:
             return False
         if self.executor is not None and event.action in self.DEFERRED_ACTIONS:

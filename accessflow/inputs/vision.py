@@ -1,7 +1,9 @@
 import ctypes
+import logging
 import math
 import os
 import sys
+import threading
 import time
 import urllib.request
 from pathlib import Path
@@ -14,7 +16,7 @@ from mediapipe.tasks.python.vision import FaceLandmarker, FaceLandmarkerOptions,
 from accessflow.core.events import InteractionEvent
 from accessflow.inputs.filters import OneEuroFilter2D
 from accessflow.inputs.mapping import (
-    RelativePointer, apply_gaze_mapping, valid_gaze_matrix,
+    DwellSelector, RelativePointer, apply_gaze_mapping, valid_gaze_matrix,
 )
 
 if sys.platform == "win32":
@@ -28,6 +30,117 @@ else:
 
 FACE_URL = "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task"
 HAND_URL = "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task"
+logger = logging.getLogger(__name__)
+
+CAMERA_BACKENDS = (
+    ("DirectShow", cv2.CAP_DSHOW),
+    ("Media Foundation", cv2.CAP_MSMF),
+    ("automatic", cv2.CAP_ANY),
+)
+
+
+class CameraUnavailableError(RuntimeError):
+    """Raised when no supported camera backend can produce a frame."""
+
+
+def open_camera():
+    """Find the first usable camera using common Windows backends.
+
+    ``isOpened`` can succeed even when a device does not deliver frames, so a
+    candidate is only accepted after one successful read. Failed captures are
+    released before trying the next backend/device.
+    """
+    attempts = []
+    for device_index in (0, 1):
+        for backend_name, backend in CAMERA_BACKENDS:
+            capture = None
+            try:
+                capture = cv2.VideoCapture(device_index, backend)
+                if capture.isOpened():
+                    capture.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+                    capture.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+                    ok, frame = capture.read()
+                    if ok and frame is not None:
+                        return capture, f"Camera {device_index} ({backend_name})"
+                    attempts.append(f"{device_index}/{backend_name}: no frame")
+                else:
+                    attempts.append(f"{device_index}/{backend_name}: not opened")
+            except Exception as exc:
+                attempts.append(f"{device_index}/{backend_name}: {exc}")
+            if capture is not None:
+                try:
+                    capture.release()
+                except Exception:
+                    pass
+    tried = ", ".join(attempts)
+    logger.warning("Camera unavailable after these attempts: %s", tried)
+    raise CameraUnavailableError(
+        "Camera unavailable. Tried devices 0 and 1. Close another app using "
+        "the camera or check Windows camera permissions, then retry.")
+
+
+class UIATargetMonitor:
+    """Poll the Windows control under the pointer away from the camera loop."""
+
+    def __init__(self, interval=0.12):
+        self.interval = max(0.08, float(interval))
+        self._lock = threading.Lock()
+        self._point = None
+        self._target = None
+        self._stop_event = threading.Event()
+        self._thread = threading.Thread(
+            target=self._run, name="AccessFlowTargetMonitor", daemon=True)
+
+    def start(self):
+        if not self._thread.is_alive():
+            self._thread.start()
+
+    def set_point(self, point):
+        with self._lock:
+            self._point = (int(point[0]), int(point[1]))
+
+    def target(self):
+        with self._lock:
+            return self._target
+
+    def stop(self):
+        self._stop_event.set()
+        if self._thread.is_alive():
+            self._thread.join(timeout=0.35)
+
+    def _run(self):
+        from accessflow.system.actions import WindowsActions
+
+        while not self._stop_event.wait(self.interval):
+            with self._lock:
+                point = self._point
+            if point is None:
+                target = None
+            else:
+                target, _ = WindowsActions.inspect_target(*point)
+            with self._lock:
+                # Do not publish a hit-test for a point the pointer has
+                # already left; stale results can spuriously reset dwell.
+                current = self._point
+                still_over_target = bool(
+                    target is not None and current is not None
+                    and len(target) >= 10
+                    and target[6] <= current[0] < target[8]
+                    and target[7] <= current[1] < target[9])
+                if current == point or still_over_target:
+                    self._target = target
+                elif self._target is not None:
+                    # A no-control result for an older pointer position must
+                    # not leave the previous control cached indefinitely. Keep
+                    # it only while the pointer is still inside that control's
+                    # bounds; the next poll will identify the new location.
+                    old = self._target
+                    still_over_previous = bool(
+                        len(old) >= 10
+                        and old[6] <= current[0] < old[8]
+                        and old[7] <= current[1] < old[9])
+                    if not still_over_previous:
+                        self._target = None
 
 # Head tracking mirrors the reference tracker in vision-access-hci: the raw
 # nose-tip position is compared with a learned neutral pose and scaled.
@@ -204,14 +317,35 @@ class HeadTracker:
         return self.smoothed
 
 
-def _model_path(name, url):
+def _model_path(name, url, stop_requested=None):
+    """Fetch a MediaPipe model without leaving a partial asset or hanging.
+
+    Downloads run on the camera worker, so each network read has a timeout and
+    the caller can stop between chunks when the user pauses the session.
+    """
     base = Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "AccessFlow" / "models"
     target = base / name
     if not target.exists():
         base.mkdir(parents=True, exist_ok=True)
         temporary = target.with_suffix(".download")
-        urllib.request.urlretrieve(url, temporary)
-        temporary.replace(target)
+        request = urllib.request.Request(
+            url, headers={"User-Agent": "AccessFlow/1.0"})
+        try:
+            with urllib.request.urlopen(request, timeout=10) as response, \
+                    temporary.open("wb") as output:
+                while True:
+                    if stop_requested and stop_requested():
+                        raise InterruptedError("Camera startup was cancelled")
+                    chunk = response.read(256 * 1024)
+                    if not chunk:
+                        break
+                    output.write(chunk)
+            if stop_requested and stop_requested():
+                raise InterruptedError("Camera startup was cancelled")
+            temporary.replace(target)
+        finally:
+            if temporary.exists():
+                temporary.unlink(missing_ok=True)
     return str(target)
 
 
@@ -223,17 +357,35 @@ class VisionWorker(QThread):
     # worker was constructed with ``preview`` set; the payload is a plain dict
     # of a mirrored RGB frame plus landmarks and the mapped cursor.
     preview_ready = Signal(object)
+    dwell_feedback = Signal(object)
 
     def __init__(self, width, height, gaze_enabled, gestures_enabled,
-                 gaze_transform=None, head_enabled=False, preview=None):
+                 gaze_transform=None, head_enabled=False, preview=None,
+                 dwell_ms=1200):
         super().__init__()
         self.width, self.height = width, height
         self.gaze_enabled, self.gestures_enabled, self.head_enabled = gaze_enabled, gestures_enabled, head_enabled
         self.preview = preview
         self.stop_requested = False
-        self.previous_pinch = False
-        self.last_pinch_click = 0.0
-        self.pinch_started_at = None
+        self.dwell_ms = max(500, min(3000, int(dwell_ms)))
+        self.screen_dwell = DwellSelector(self.dwell_ms)
+        self.dwell_started_at = None
+        self.dwell_anchor = None
+        self.dwell_candidate_at = None
+        self.dwell_armed = False
+        self.next_dwell_button = "left"
+        self.dwell_candidate_button = None
+        self.dwell_stability_ms = 250
+        self.dwell_pointer_anchor = None
+        self.dwell_locked = False
+        self.dwell_lock_anchor = None
+        self.dwell_cooldown_until = 0.0
+        self.hand_dwell_target = None
+        self.target_monitor = UIATargetMonitor()
+        self.hand_suppressed_until = 0.0
+        self.hand_pinched = False
+        self.hand_pinch_enter_ratio = 0.32
+        self.hand_pinch_exit_ratio = 0.48
         self.last_hand_seen = 0.0
         self.pointer_suspended_until = 0.0
         self.pointer_was_suspended = False
@@ -243,9 +395,13 @@ class VisionWorker(QThread):
         self.pointer_last = None
         self.head_tracker = HeadTracker()
         # Hands use a relative trackpad mapping, never an absolute one. The
-        # dead zone with its slow leak does the tremor suppression; a
+        # dead zone with a fixed reference does the tremor suppression; a
         # pre-filter would lag behind the finger and swallow slow movement.
         self.hand_pointer = RelativePointer(width, height)
+        # Live control should continue from the user's current cursor location,
+        # not jump to screen center when the first hand frame arrives.
+        if not self.preview:
+            self.hand_pointer.reset(self._screen_pointer() or (0.5, 0.5))
         self.recenter_requested = False
         self.pointer_filters = {
             # Eye gaze is inherently noisy and calibrated; keep it slow.
@@ -374,15 +530,20 @@ class VisionWorker(QThread):
         # Right eye: iris=473, corners inner=362, outer=263
         for iris_idx, a_idx, b_idx in ((468, 33, 133), (473, 362, 263)):
             iris, a, b = marks[iris_idx], marks[a_idx], marks[b_idx]
+            if not all(math.isfinite(value) for value in
+                       (iris.x, iris.y, a.x, a.y, b.x, b.y)):
+                continue
             axis_x = b.x - a.x
             axis_y = b.y - a.y
             width_sq = axis_x * axis_x + axis_y * axis_y
-            if width_sq < 1e-6:
+            if not math.isfinite(width_sq) or width_sq < 1e-6:
                 continue
             rel_x = iris.x - a.x
             rel_y = iris.y - a.y
             x = (rel_x * axis_x + rel_y * axis_y) / width_sq
             y = (axis_x * rel_y - axis_y * rel_x) / width_sq
+            if not (math.isfinite(x) and math.isfinite(y)):
+                continue
             features.append((x, y))
         if not features:
             return None
@@ -418,62 +579,234 @@ class VisionWorker(QThread):
             "cursor": cursor,
             "label": label,
             "calibrated": calibrated,
+            "dwell_progress": self._preview_dwell_progress,
         })
+
+    def _update_screen_dwell(self, source, cursor, now, pointer_active):
+        """Update eye/head dwell and emit a one-shot left click when live."""
+        point = (cursor[0] * (self.width - 1),
+                 cursor[1] * (self.height - 1))
+        target = None
+        if self.preview is None and pointer_active:
+            # Windows UI Automation may block; a helper thread keeps camera
+            # tracking responsive while refreshing the control under the cursor.
+            self.target_monitor.set_point(point)
+            target = self.target_monitor.target()
+        progress, clicked = self.screen_dwell.update(
+            point, now, source, enabled=(self.preview is not None or pointer_active),
+            target=target)
+        self._preview_dwell_progress = progress
+        if not self.preview and (progress < 1.0 or clicked):
+            self.dwell_feedback.emit({"point": point, "progress": progress})
+        if clicked and not self.preview:
+            self.event_ready.emit(InteractionEvent(
+                source, "dwell", "click_target", 0.90, {
+                    "button": "left", "x": int(point[0]), "y": int(point[1])}))
+        return progress, clicked
 
     def _hand_tracking(self, points, now, pointer_active):
         """Map one detected hand and update the relative pointer.
 
         Returns ``(cursor, label)`` for the preview and the live pointer path.
         """
-        index_tip, thumb_tip = points[8], points[4]
-        cursor = self.hand_pointer.update(index_tip.x, index_tip.y)
+        index_tip = points[8]
+        if self.preview == "hand":
+            # Preview is for checking the hand-to-pointer path, never for
+            # rehearsing a click. In particular, do not arm dwell or freeze
+            # the cursor here: preview cannot click, and a frozen cursor made
+            # hand tracking look broken after the index-only dwell change.
+            cursor = self.hand_pointer.update(index_tip.x, index_tip.y)
+            return cursor, "Move index to steer · preview does not click"
 
-        palm_size = math.hypot(points[0].x - points[9].x, points[0].y - points[9].y)
-        pinch_ratio = math.hypot(index_tip.x - thumb_tip.x,
-                                 index_tip.y - thumb_tip.y) / max(palm_size, 0.001)
-        clicked = False
-        if not self.previous_pinch and pinch_ratio <= 0.32:
-            if self.pinch_started_at is None:
-                self.pinch_started_at = now
-            elif now - self.pinch_started_at >= 0.08 and now - self.last_pinch_click >= 0.70:
-                self.previous_pinch = True
-                self.last_pinch_click = now
-                clicked = True
-        elif self.previous_pinch and pinch_ratio >= 0.48:
-            self.previous_pinch = False
-            self.pinch_started_at = None
-        elif not self.previous_pinch and pinch_ratio > 0.32:
-            self.pinch_started_at = None
+        pose = self._hand_pose(points)
+        # Keep pinching explicitly out of the dwell path; otherwise a held
+        # pinch could cause an unintended click while the fingertip is steady.
+        if self._hand_is_pinched(points):
+            pose = "other"
+        if self.dwell_locked:
+            if (self.dwell_lock_anchor is not None
+                    and math.hypot(index_tip.x - self.dwell_lock_anchor[0],
+                                   index_tip.y - self.dwell_lock_anchor[1]) > 0.03):
+                self.dwell_locked = False
+                self.dwell_lock_anchor = None
+                self.hand_pointer.on_hand_lost()
+                cursor = self.hand_pointer.position
+                self.dwell_armed = False
+                self.dwell_started_at = now
+                self.dwell_anchor = (index_tip.x, index_tip.y)
+                self.dwell_candidate_at = None
+                self.dwell_candidate_button = None
+                self.dwell_cooldown_until = 0.0
+                self.dwell_candidate_at = now
+                self.dwell_candidate_button = (
+                    None if self.hand_pinched else
+                    "right" if pose == "two_fingers" else "left")
+                self.dwell_pointer_anchor = None
+            else:
+                cursor = self.hand_pointer.position
+                return cursor, "Move away to re-arm clicking"
+        # Freeze pointer output while a dwell timer is active. Otherwise the
+        # movement used to stabilize a noisy finger can keep displacing the
+        # desktop cursor while the user is trying to select a target.
+        cursor = self.hand_pointer.position
+        if not self.dwell_armed and not self.dwell_locked:
+            cursor = self.hand_pointer.update(index_tip.x, index_tip.y)
+        target = None
+        if pointer_active:
+            screen_point = (cursor[0] * (self.width - 1),
+                            cursor[1] * (self.height - 1))
+            self.target_monitor.set_point(screen_point)
+            target = self.target_monitor.target()
+        if target != self.hand_dwell_target:
+            self.hand_dwell_target = target
+            self.dwell_armed = False
+            self.dwell_started_at = None
+            self.dwell_candidate_at = None
+            self.dwell_candidate_button = None
+            self.dwell_anchor = (index_tip.x, index_tip.y)
+        current = (index_tip.x, index_tip.y)
+        if self.dwell_anchor is None:
+            self.dwell_anchor = current
+            self.dwell_started_at = now
+        elif math.hypot(current[0] - self.dwell_anchor[0],
+                        current[1] - self.dwell_anchor[1]) > 0.012:
+            self.dwell_anchor = current
+            self.dwell_started_at = now
+        else:
+            self.dwell_anchor = (0.8 * self.dwell_anchor[0] + 0.2 * current[0],
+                                 0.8 * self.dwell_anchor[1] + 0.2 * current[1])
 
-        label = "Pinch detected - click" if self.previous_pinch else "Move your index finger to steer"
-        if clicked and pointer_active and not self.preview:
-            self.event_ready.emit(InteractionEvent(
-                "gestures", "pinch", "click", 0.90, {"button": "left"}))
+        # Left click depends only on index-tip stability; the other fingers
+        # may be relaxed or curled. Reserve two raised fingers for right click.
+        button = None if self.hand_pinched else (
+            "right" if pose == "two_fingers" else "left")
+        if now < self.dwell_cooldown_until:
+            if pointer_active:
+                self.dwell_feedback.emit({"point": (cursor[0] * (self.width - 1),
+                                                     cursor[1] * (self.height - 1)),
+                                          "progress": 0.0})
+            self.dwell_armed = False
+            self.dwell_started_at = None
+            if button is None:
+                self.dwell_candidate_button = None
+                self.dwell_candidate_at = None
+            return cursor, "Click sent - wait briefly"
+        if button is not None:
+            if button != self.dwell_candidate_button:
+                self.dwell_candidate_button = button
+                self.dwell_candidate_at = now
+                self.dwell_armed = False
+            elif (not self.dwell_armed and self.dwell_candidate_at is not None
+                  and now - self.dwell_candidate_at >= self.dwell_stability_ms / 1000.0):
+                self.dwell_armed = True
+                self.next_dwell_button = button
+                self.dwell_started_at = now
+                self.dwell_anchor = current
+            elif self.dwell_armed:
+                if math.hypot(current[0] - self.dwell_anchor[0],
+                              current[1] - self.dwell_anchor[1]) > 0.012:
+                    self.dwell_armed = False
+                    self.dwell_candidate_button = None
+                    self.dwell_candidate_at = None
+                    self.dwell_started_at = None
+                elif now - self.dwell_started_at >= self.dwell_ms / 1000.0:
+                    self.dwell_feedback.emit({
+                        "point": (cursor[0] * (self.width - 1),
+                                  cursor[1] * (self.height - 1)),
+                        "progress": 1.0})
+                    if not self.preview:
+                        self.event_ready.emit(InteractionEvent(
+                            "gestures", "dwell", "click_target", 0.90, {
+                                "button": button,
+                                "x": int(cursor[0] * (self.width - 1)),
+                                "y": int(cursor[1] * (self.height - 1))}))
+                    self.dwell_cooldown_until = now + 0.45
+                    self.dwell_armed = False
+                    self.dwell_started_at = None
+                    self.dwell_anchor = current
+                    self.dwell_locked = True
+                    self.dwell_lock_anchor = current
+                    return cursor, f"{button.title()} click sent"
+            if pointer_active:
+                progress = (max(0.0, min(1.0, (now - self.dwell_started_at)
+                                        / (self.dwell_ms / 1000.0)))
+                            if self.dwell_armed and self.dwell_started_at is not None
+                            else 0.0)
+                self.dwell_feedback.emit({
+                    "point": (cursor[0] * (self.width - 1),
+                              cursor[1] * (self.height - 1)),
+                    "progress": progress})
+        else:
+            if pointer_active:
+                self.dwell_feedback.emit({"point": (cursor[0] * (self.width - 1),
+                                                     cursor[1] * (self.height - 1)),
+                                          "progress": 0.0})
+            self.dwell_armed = False
+            self.dwell_candidate_button = None
+            self.dwell_candidate_at = None
+            self.dwell_started_at = None
+        if self.hand_pinched:
+            return cursor, "Pinch ignored - release to use dwell"
+        label = (f"Hold still for {self.next_dwell_button} click"
+                 if self.dwell_armed else "Move index to steer")
         return cursor, label
+
+    @staticmethod
+    def _hand_pose(points):
+        """Classify the index+middle right-click pose and open-hand shape."""
+        wrist = points[0]
+
+        def extended(tip, pip):
+            tip_point, pip_point = points[tip], points[pip]
+            return math.hypot(tip_point.x - wrist.x, tip_point.y - wrist.y) > (
+                math.hypot(pip_point.x - wrist.x, pip_point.y - wrist.y) * 1.12)
+
+        index, middle = extended(8, 6), extended(12, 10)
+        ring, pinky = extended(16, 14), extended(20, 18)
+        if index and middle and not ring and not pinky:
+            return "two_fingers"
+        if index and middle and ring and pinky:
+            return "open"
+        return "other"
+
+    def _hand_is_pinched(self, points):
+        """Use a hand-size-relative hysteresis gate to suppress pinch poses."""
+        palm_size = math.hypot(points[0].x - points[9].x,
+                               points[0].y - points[9].y)
+        if palm_size < 1e-4:
+            self.hand_pinched = False
+            return False
+        ratio = math.hypot(points[8].x - points[4].x,
+                           points[8].y - points[4].y) / palm_size
+        if self.hand_pinched:
+            if ratio >= self.hand_pinch_exit_ratio:
+                self.hand_pinched = False
+        elif ratio <= self.hand_pinch_enter_ratio:
+            self.hand_pinched = True
+        return self.hand_pinched
 
     def run(self):
         capture = face = hand = None
         reported_stop = False
         try:
-            capture = cv2.VideoCapture(0, cv2.CAP_DSHOW)
-            capture.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-            capture.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-            if not capture.isOpened():
-                self.status.emit("Camera unavailable")
-                reported_stop = True
-                return
+            capture, camera_description = open_camera()
+            self.target_monitor.start()
             if self.gaze_enabled or self.head_enabled:
                 face = FaceLandmarker.create_from_options(FaceLandmarkerOptions(
-                    base_options=BaseOptions(model_asset_path=_model_path("face_landmarker.task", FACE_URL)),
+                    base_options=BaseOptions(model_asset_path=_model_path(
+                        "face_landmarker.task", FACE_URL,
+                        stop_requested=lambda: self.stop_requested)),
                     running_mode=RunningMode.VIDEO, num_faces=1,
                     min_face_detection_confidence=0.70, min_face_presence_confidence=0.60,
                     min_tracking_confidence=0.65))
             if self.gestures_enabled:
                 hand = HandLandmarker.create_from_options(HandLandmarkerOptions(
-                    base_options=BaseOptions(model_asset_path=_model_path("hand_landmarker.task", HAND_URL)),
+                    base_options=BaseOptions(model_asset_path=_model_path(
+                        "hand_landmarker.task", HAND_URL,
+                        stop_requested=lambda: self.stop_requested)),
                     running_mode=RunningMode.VIDEO, num_hands=1, min_hand_detection_confidence=0.70,
                     min_hand_presence_confidence=0.60, min_tracking_confidence=0.65))
-            self.status.emit("Camera inputs active")
+            self.status.emit(f"Camera inputs active - {camera_description}")
             timestamp = int(time.monotonic() * 1000)
             last_face_seen = time.monotonic()
             last_face_warning = 0.0
@@ -520,24 +853,37 @@ class VisionWorker(QThread):
                 preview_cursor = None
                 preview_label = ""
                 preview_calibrated = True
+                self._preview_dwell_progress = 0.0
                 if hand:
                     hands = hand.detect_for_video(image, timestamp).hand_landmarks
                     if hands:
                         hand_seen = True
+                        self.screen_dwell.reset()
                         self.last_hand_seen = time.monotonic()
                         points = hands[0]
+                        if not getattr(self, "_hand_reported", False):
+                            self._hand_reported = True
+                            self.status.emit("Hand detected")
                         preview_points = [(p.x, p.y) for p in points]
                         if pointer_active:
+                            if not self.preview and self.pointer_source != "gestures":
+                                # Re-anchor on control handoff (for example
+                                # when eye/head control was also selected).
+                                self.hand_pointer.reset(
+                                    self._screen_pointer() or self.pointer_last
+                                    or (0.5, 0.5))
                             cursor, preview_label = self._hand_tracking(
                                 points, now, pointer_active)
                             preview_cursor = cursor
                             if not self.preview:
                                 self.pointer_source = "gestures"
                                 self.pointer_last = cursor
-                                self.event_ready.emit(InteractionEvent(
-                                    "gestures", "pointer", "move_pointer", 0.86, {
-                                        "x": int(cursor[0] * (self.width - 1)),
-                                        "y": int(cursor[1] * (self.height - 1))}))
+                                if (not self.dwell_locked
+                                        and not self.dwell_armed):
+                                    self.event_ready.emit(InteractionEvent(
+                                        "gestures", "pointer", "move_pointer", 0.86, {
+                                            "x": int(cursor[0] * (self.width - 1)),
+                                            "y": int(cursor[1] * (self.height - 1))}))
                         else:
                             preview_label = "Pointer handed to touchpad"
                     else:
@@ -545,8 +891,16 @@ class VisionWorker(QThread):
                         # re-anchor on the next detection. This is what stops
                         # the pointer running off when the hand comes back.
                         self.hand_pointer.on_hand_lost()
-                        self.previous_pinch = False
-                        self.pinch_started_at = None
+                        self.dwell_anchor = None
+                        self.dwell_started_at = None
+                        self.dwell_armed = False
+                        self.dwell_candidate_at = None
+                        self.dwell_candidate_button = None
+                        self.dwell_pointer_anchor = None
+                        self.dwell_locked = False
+                        self.dwell_lock_anchor = None
+                        self.dwell_cooldown_until = 0.0
+                        self.hand_pinched = False
                         if self.preview == "hand":
                             preview_label = "Show your hand to the camera"
                 # A visible hand owns the camera interaction for this frame; this avoids gaze/gesture cursor contention.
@@ -563,19 +917,26 @@ class VisionWorker(QThread):
                         if self.gaze_enabled:
                             gaze_feat = self._extract_gaze_feature(landmarks)
                             if gaze_feat is not None:
+                                dwell_progress = 0.0
                                 rx, ry = gaze_feat
                                 self.gaze_sample.emit((rx, ry))
                                 if self.gaze_transform is not None:
                                     raw = apply_gaze_mapping(self.gaze_transform, rx, ry)
                                     gaze_active = True
+                                    sx, sy = self._smooth_pointer(
+                                        "gaze", raw[0], raw[1], 6.0, absolute=True)
+                                    dwell_progress, _ = self._update_screen_dwell(
+                                        "gaze", (sx, sy), now, pointer_active)
                                     if pointer_active and not self.preview:
-                                        sx, sy = self._smooth_pointer(
-                                            "gaze", raw[0], raw[1], 6.0, absolute=True)
                                         self.pointer_source = "gaze"
                                         self.pointer_last = (sx, sy)
                                         self.event_ready.emit(InteractionEvent("gaze", "gaze", "move_pointer", 0.82, {
                                             "x": int(sx * (self.width - 1)), "y": int(sy * (self.height - 1))}))
-                                    preview_cursor = raw
+                                    # Preview and live control must show the
+                                    # same filtered mapping, so a user can
+                                    # diagnose jitter before enabling desktop
+                                    # pointer movement.
+                                    preview_cursor = (sx, sy)
                                 elif self.preview:
                                     # Uncalibrated preview still shows the raw
                                     # iris position so the user can see that
@@ -587,9 +948,13 @@ class VisionWorker(QThread):
                                     preview_points = [
                                         (landmarks[i].x, landmarks[i].y)
                                         for i in PREVIEW_FACE_POINTS]
-                                    preview_label = ("Gaze mapped to the screen"
-                                                     if self.gaze_transform is not None
-                                                     else "Not calibrated - run Calibration")
+                                    if preview_calibrated:
+                                        preview_label = (
+                                            f"Hold still for left click · {dwell_progress:.0%}"
+                                            if dwell_progress > 0 else
+                                            "Hold gaze steady to dwell-click")
+                                    else:
+                                        preview_label = "Not calibrated - run the nine-point calibration"
                         if self.head_enabled and not gaze_active:
                             if self.recenter_requested:
                                 self.head_tracker.reset()
@@ -617,8 +982,13 @@ class VisionWorker(QThread):
                                         for i in PREVIEW_FACE_POINTS]
                                 if point is not None:
                                     preview_cursor = point
+                                    dwell_progress, _ = self._update_screen_dwell(
+                                        "head", point, now, pointer_active)
                                     if self.preview:
-                                        preview_label = "Move your head to steer"
+                                        preview_label = (
+                                            f"Hold still for left click · {dwell_progress:.0%}"
+                                            if dwell_progress > 0 else
+                                            "Move your head; hold still to dwell-click")
                                     elif pointer_active:
                                         self.pointer_source = "head"
                                         self.pointer_last = point
@@ -635,16 +1005,25 @@ class VisionWorker(QThread):
                     last_preview = now
                     self._emit_preview(rgb, preview_points, preview_cursor,
                                        preview_label, preview_calibrated)
+        except CameraUnavailableError as exc:
+            self.status.emit(str(exc))
+            reported_stop = True
         except Exception as exc:
             self.status.emit(f"Camera stopped: {exc}")
             reported_stop = True
         finally:
-            if face:
-                face.close()
-            if hand:
-                hand.close()
-            if capture:
-                capture.release()
+            self.target_monitor.stop()
+            # A MediaPipe close failure must not leave the camera device open;
+            # release each resource independently during every exit path.
+            for resource, method_name in (
+                    (face, "close"), (hand, "close"),
+                    (capture, "release")):
+                if resource is None:
+                    continue
+                try:
+                    getattr(resource, method_name)()
+                except Exception:
+                    logger.exception("Could not %s camera resource", method_name)
             if not reported_stop:
                 self.status.emit("Camera inputs stopped")
 

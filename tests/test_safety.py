@@ -22,6 +22,7 @@ import accessflow.system.actions as actions_module
 from accessflow.core.engine import InteractionEngine
 from accessflow.core.events import InteractionEvent
 from accessflow.system.actions import ActionExecutor, WindowsActions
+from accessflow.inputs.voice import VoiceWorker
 
 
 class FakeActions:
@@ -43,6 +44,9 @@ class FakeActions:
 
     def click(self, button="left", clicks=1):
         self.calls.append(("click", button))
+
+    def click_target(self, button="left", x=None, y=None):
+        self.calls.append(("click_target", button, x, y))
 
     def scroll(self, amount):
         self.calls.append(("scroll", amount))
@@ -110,13 +114,19 @@ class EngineTests(unittest.TestCase):
 
     def test_low_confidence_command_is_rejected(self):
         self.engine.start(["voice"])
-        self.dispatch("voice", "click", 0.65, button="left")
+        self.dispatch("voice", "click", 0.64, button="left")
         self.assertEqual(self.actions.calls, [])
+
 
     def test_valid_command_reaches_the_desktop(self):
         self.engine.start(["voice"])
         self.dispatch("voice", "click", 0.90, button="left")
         self.assertEqual(self.actions.calls, [("click", "left")])
+
+    def test_target_click_is_deferred_and_accepts_its_configured_threshold(self):
+        self.engine.start(["voice"])
+        self.dispatch("voice", "click_target", 0.65, button="left", x=20, y=30)
+        self.assertEqual(self.executor.submitted, ["click_target"])
 
     def test_disabled_source_is_ignored(self):
         self.engine.start(["head"])
@@ -152,6 +162,30 @@ class EngineTests(unittest.TestCase):
         self.engine.start(["voice"])
         self.dispatch("voice", "click", 1.5, button="left")
         self.assertEqual(self.actions.calls, [])
+
+
+class VoicePhraseTests(unittest.TestCase):
+    def setUp(self):
+        self.worker = VoiceWorker("unused-model")
+        self.events = []
+        self.statuses = []
+        self.worker.event_ready.connect(self.events.append)
+        self.worker.status.connect(self.statuses.append)
+
+    def test_left_click_uses_target_activation(self):
+        self.worker._phrase("left click", 0.9, average=0.8)
+        self.assertEqual(len(self.events), 1)
+        self.assertEqual(self.events[0].action, "click_target")
+        self.assertEqual(self.events[0].payload["button"], "left")
+
+    def test_unclear_left_click_is_rejected(self):
+        self.worker._phrase("left click", 0.9, average=0.64)
+        self.assertEqual(self.events, [])
+        self.assertTrue(self.statuses)
+
+    def test_dictation_preserves_recognized_case(self):
+        self.worker._phrase("type Hello World", 0.8, average=0.8)
+        self.assertEqual(self.events[0].payload["text"], "Hello World")
 
 
 class ExecutorTests(unittest.TestCase):
@@ -224,7 +258,9 @@ class TypeTextCancellationTests(unittest.TestCase):
         self.actions = WindowsActions()
         self.typed = []
         write = lambda text, interval=0: self.typed.append(text)
-        self.patch = mock.patch.object(actions_module.pyautogui, "write", write)
+        self.pyautogui = type("FakePyAutoGUI", (), {"write": staticmethod(write)})()
+        self.patch = mock.patch.object(
+            actions_module, "_pyautogui", lambda: self.pyautogui)
         self.patch.start()
 
     def tearDown(self):
@@ -253,6 +289,36 @@ class TypeTextCancellationTests(unittest.TestCase):
         self.actions.type_text("b" * (actions_module.MAX_TYPE_CHARS + 500))
         self.assertEqual(sum(len(c) for c in self.typed),
                          actions_module.MAX_TYPE_CHARS)
+
+    def test_new_session_does_not_uncancel_an_inflight_old_phrase(self):
+        first_started = threading.Event()
+        release_first = threading.Event()
+        new_phrase_done = threading.Event()
+
+        def write(text, interval=0):
+            self.typed.append(text)
+            if text.startswith("a") and not first_started.is_set():
+                first_started.set()
+                release_first.wait(2.0)
+            elif text == "new":
+                new_phrase_done.set()
+
+        self.pyautogui.write = write
+        with mock.patch.object(self.actions, "attach_input_desktop"):
+            executor = ActionExecutor(self.actions)
+        try:
+            executor.submit(self.actions.type_text, {"text": "a" * 200})
+            self.assertTrue(first_started.wait(2.0))
+            executor.cancel()
+            executor.submit(self.actions.type_text, {"text": "new"})
+            release_first.set()
+            self.assertTrue(new_phrase_done.wait(2.0))
+        finally:
+            release_first.set()
+            executor.stop()
+        old_text = sum(len(chunk) for chunk in self.typed
+                       if chunk and set(chunk) == {"a"})
+        self.assertEqual(old_text, actions_module.TYPE_CHUNK_CHARS)
 
 
 @unittest.skipUnless(sys.platform == "win32", "Windows hooks only")

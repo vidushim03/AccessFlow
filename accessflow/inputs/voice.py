@@ -17,6 +17,11 @@ MODEL_URL = "https://alphacephei.com/vosk/models/vosk-model-small-en-us-0.15.zip
 COMMAND_MIN_CONFIDENCE = 0.72
 # Dictation is scored on the average word; keeps the two thresholds together.
 DICTATION_MIN_CONFIDENCE = 0.60
+# A correct left-click command can have one weakly scored word (often "left")
+# even when the phrase as a whole is clear. Keep an exact-phrase check and use
+# average word confidence, while leaving destructive/open/scroll commands at
+# the stricter weakest-word threshold.
+LEFT_CLICK_MIN_CONFIDENCE = 0.65
 # Blocks waiting for the recogniser (8000 frames at 16 kHz = 0.5 s each).
 # Recognition slower than realtime must drop audio, not grow without bound.
 AUDIO_QUEUE_BLOCKS = 50
@@ -27,14 +32,38 @@ class VoiceModelDownloadWorker(QThread):
     failed = Signal(str)
     status = Signal(str)
 
+    def __init__(self):
+        super().__init__()
+        self.stop_requested = False
+
+    def stop(self):
+        """Stop a model download between bounded network reads."""
+        self.stop_requested = True
+
     def run(self):
         base = Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "AccessFlow" / "models"
-        base.mkdir(parents=True, exist_ok=True)
         archive = base / "vosk-model-small-en-us-0.15.zip"
         temporary = archive.with_suffix(".download")
         try:
+            base.mkdir(parents=True, exist_ok=True)
             self.status.emit("Downloading offline speech model…")
-            urllib.request.urlretrieve(MODEL_URL, temporary)
+            request = urllib.request.Request(
+                MODEL_URL, headers={"User-Agent": "AccessFlow/1.0"})
+            with urllib.request.urlopen(request, timeout=5) as response, \
+                    temporary.open("wb") as output:
+                total = int(response.headers.get("Content-Length", 0) or 0)
+                received = 0
+                while not self.stop_requested:
+                    chunk = response.read(256 * 1024)
+                    if not chunk:
+                        break
+                    output.write(chunk)
+                    received += len(chunk)
+                    if total:
+                        self.status.emit(
+                            f"Downloading offline speech model… {received * 100 // total}%")
+            if self.stop_requested:
+                return
             temporary.replace(archive)
             with zipfile.ZipFile(archive) as zipped:
                 for info in zipped.infolist():
@@ -42,6 +71,8 @@ class VoiceModelDownloadWorker(QThread):
                     if os.path.commonpath((str(base.resolve()), str(target))) != str(base.resolve()):
                         raise ValueError("Model archive contains an unsafe path")
                 zipped.extractall(base)
+            if self.stop_requested:
+                return
             model = base / "vosk-model-small-en-us-0.15"
             self.completed.emit(str(model))
         except Exception as exc:
@@ -72,7 +103,8 @@ class VoiceWorker(QThread):
         self.stop_requested = True
 
     def _phrase(self, value, confidence, average=None):
-        text = value.lower().strip()
+        recognized = str(value).strip()
+        text = recognized.lower()
         confidence = float(confidence)
         average = confidence if average is None else float(average)
         if not text or not math.isfinite(confidence) or not math.isfinite(average):
@@ -85,14 +117,21 @@ class VoiceWorker(QThread):
             if average < DICTATION_MIN_CONFIDENCE:
                 return
             self.event_ready.emit(InteractionEvent(
-                "voice", "dictation", "type_text", round(average, 3), {"text": text[5:]}))
+                "voice", "dictation", "type_text", round(average, 3),
+                {"text": recognized[5:].strip()}))
+            return
+        if text in ("left click", "click"):
+            if average < LEFT_CLICK_MIN_CONFIDENCE:
+                self.status.emit("Left-click phrase was unclear; please repeat ‘left click’")
+                return
+            self.event_ready.emit(InteractionEvent(
+                "voice", "command", "click_target", round(average, 3),
+                {"button": "left"}))
             return
         if confidence < COMMAND_MIN_CONFIDENCE:
             return
         if text in ("pause accessflow", "stop accessflow", "emergency pause"):
             event = InteractionEvent("voice", "emergency_pause", "pause", confidence)
-        elif text in ("left click", "click"):
-            event = InteractionEvent("voice", "command", "click", confidence, {"button": "left"})
         elif text == "right click":
             event = InteractionEvent("voice", "command", "click", confidence, {"button": "right"})
         elif text == "scroll up":

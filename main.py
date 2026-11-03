@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import sys
 import time
 import warnings
@@ -17,14 +18,16 @@ from PySide6.QtGui import (
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QFileDialog, QFrame, QHBoxLayout, QLabel,
     QLineEdit, QMainWindow, QMenu, QMessageBox, QPushButton, QSlider,
-    QStackedWidget, QSystemTrayIcon, QVBoxLayout, QWidget
+    QGridLayout, QScrollArea, QStackedWidget, QSystemTrayIcon, QVBoxLayout,
+    QWidget,
 )
 
 from accessflow.core.engine import InteractionEngine
 from accessflow.system.hotkey import GlobalEscapeListener, GlobalPointerActivity
 from accessflow.system.actions import ActionExecutor, WindowsActions
 from accessflow.inputs.mapping import (
-    GAZE_MODEL_QUADRATIC, fit_gaze_mapping, valid_gaze_matrix,
+    GAZE_MODEL_AFFINE, GAZE_MODEL_QUADRATIC, fit_best_gaze_mapping,
+    leave_one_out_gaze_predictions, model_for_matrix, valid_gaze_matrix,
 )
 from accessflow.inputs.vision import (
     HAND_CONNECTIONS, PREVIEW_FACE_POINTS, VisionWorker,
@@ -33,23 +36,20 @@ from accessflow.inputs.voice import VoiceModelDownloadWorker, VoiceWorker
 
 APP_NAME = "AccessFlow"
 
-# Gaze calibration is accepted only once the eye feature has settled at each
-# target. 0.10 is the tolerance for the iris-in-eye feature (roughly 4-5 px of
-# iris jitter at 640x480). A still eye still produces microsaccadic and
-# landmark jitter, and corner targets rotate the eye so the iris sits near a
-# corner - sometimes partly under the lid - so the threshold must be loose
-# enough to accept genuine stillness while still rejecting a user whose eye is
-# actively moving between targets (which moves the feature by ~0.2+).
-CALIBRATION_STABLE_STD = 0.10
-CALIBRATION_MIN_SAMPLES = 10
+# Gaze calibration is accepted only after the eye feature has settled. The
+# research Eye Control Mouse reference uses a 0.07 standard-deviation limit
+# for iris position normalized by eye width. AccessFlow uses that feature too.
+CALIBRATION_STABLE_STD = 0.07
+CALIBRATION_MIN_SAMPLES = 15
 # Frames right after a target appears are transition frames: the eye needs time
 # to saccade to the new dot and settle, and on the first dot the user needs
-# time to locate it. 0.5 s keeps transition/saccade samples out of the stability
+# time to locate it. 1.5 s keeps transition/saccade samples out of the stability
 # window without making each point feel sluggish.
-CALIBRATION_SAMPLE_GRACE = 0.5
-CALIBRATION_POINT_TIMEOUT = 8.0
-# Mean fit error as a fraction of the screen. 0.08 is about 150 px at 1920 wide;
-# anything looser accepts a mapping that cannot reach the edges accurately.
+CALIBRATION_SAMPLE_GRACE = 1.5
+CALIBRATION_MIN_DWELL = 2.5
+CALIBRATION_POINT_TIMEOUT = 12.0
+# Leave-one-out position error in normalized screen coordinates. Keep the
+# limit conservative so a clearly unstable mapping is never activated.
 CALIBRATION_MAX_ERROR = 0.08
 GAZE_FEATURE = "iris_in_eye_v1"
 CALIBRATION_KEY = "gaze/calibration"
@@ -61,14 +61,12 @@ def _valid_gaze_matrix(value):
     return None if array is None else array.tolist()
 
 
-# The page order is shared by the sidebar buttons and programmatic
-# navigation, so a new page cannot silently shift "go to Calibration".
+# The page order is shared by the sidebar buttons and programmatic navigation.
 PAGE_DASHBOARD = 0
 PAGE_INPUTS = 1
-PAGE_CALIBRATION = 2
-PAGE_PREVIEW = 3
-PAGE_ACCESSIBILITY = 4
-PAGE_ABOUT = 5
+PAGE_PREVIEW = 2
+PAGE_ACCESSIBILITY = 3
+PAGE_ABOUT = 4
 
 
 class CalibrationOverlay(QWidget):
@@ -262,6 +260,15 @@ class TrackingPreviewWidget(QWidget):
         painter.drawEllipse(int(cx - 6), int(cy - 6), 12, 12)
         painter.setBrush(QColor("#ffffff"))
         painter.drawEllipse(int(cx - 2), int(cy - 2), 4, 4)
+        if payload.get("mode") in ("gaze", "head"):
+            progress = max(0.0, min(1.0, float(payload.get("dwell_progress", 0.0))))
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.setPen(QPen(QColor("#93a8bb"), 2))
+            painter.drawEllipse(int(cx - 14), int(cy - 14), 28, 28)
+            if progress > 0:
+                painter.setPen(QPen(QColor("#34d399"), 3))
+                painter.drawArc(QRect(int(cx - 14), int(cy - 14), 28, 28),
+                                90 * 16, -int(progress * 360 * 16))
         if not payload.get("calibrated", True):
             painter.setPen(QColor("#fbbf24"))
             painter.drawText(screen.adjusted(10, 0, -10, -8),
@@ -271,6 +278,157 @@ class TrackingPreviewWidget(QWidget):
 
 class Bus(QObject):
     status = Signal(str)
+
+
+class AccessFlowKeyboard(QWidget):
+    """Non-activating on-screen keyboard for hand/head/eye pointer users."""
+
+    key_requested = Signal(str, bool)
+
+    def __init__(self, parent=None):
+        flags = (Qt.WindowType.Tool | Qt.WindowType.WindowStaysOnTopHint
+                 | Qt.WindowType.WindowDoesNotAcceptFocus)
+        super().__init__(parent, flags)
+        self.setWindowTitle("AccessFlow Keyboard")
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
+        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.setMinimumWidth(560)
+        self.setWindowOpacity(0.98)
+        self._shifted = False
+        self._caps_locked = False
+
+        layout = QVBoxLayout(self)
+        header = QHBoxLayout()
+        title = QLabel("AccessFlow keyboard")
+        title.setStyleSheet("font-size: 17px; font-weight: 700; padding: 4px;")
+        header.addWidget(title)
+        header.addStretch()
+        close = QPushButton("Close")
+        close.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        close.clicked.connect(self.hide)
+        header.addWidget(close)
+        layout.addLayout(header)
+        help_text = QLabel(
+            "Use your active pointer to click or dwell on the text field, then dwell "
+            "on a key here. This window stays open without taking text focus.")
+        help_text.setWordWrap(True)
+        layout.addWidget(help_text)
+
+        grid = QGridLayout()
+        grid.setSpacing(5)
+        rows = [
+            list("1234567890") + ["Backspace"],
+            list("qwertyuiop"),
+            list("asdfghjkl") + ["Enter"],
+            list("zxcvbnm") + [".", ",", "Caps", "Shift"],
+        ]
+        for row_index, row in enumerate(rows):
+            for col_index, label in enumerate(row):
+                button = QPushButton(label)
+                button.setMinimumSize(42 if len(label) == 1 else 76, 42)
+                button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+                if label in ("Caps", "Shift"):
+                    button.setCheckable(True)
+                    if label == "Caps":
+                        self.caps_button = button
+                    else:
+                        self.shift_button = button
+                button.clicked.connect(
+                    lambda checked=False, key=label: self._select_key(key))
+                grid.addWidget(button, row_index, col_index)
+
+        special = [
+            ("Tab", "tab"), ("Space", "space"), ("←", "left"),
+            ("↑", "up"), ("↓", "down"), ("→", "right"),
+        ]
+        row_index = len(rows)
+        for col_index, (label, key) in enumerate(special):
+            button = QPushButton(label)
+            button.setMinimumSize(64, 42)
+            button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+            button.clicked.connect(
+                lambda checked=False, value=key: self.key_requested.emit(value, True))
+            grid.addWidget(button, row_index, col_index)
+        layout.addLayout(grid)
+
+    def _select_key(self, key):
+        if key == "Shift":
+            self._shifted = not self._shifted
+            self.shift_button.setChecked(self._shifted)
+            return
+        if key == "Caps":
+            self._caps_locked = not self._caps_locked
+            self.caps_button.setChecked(self._caps_locked)
+            return
+        if key == "Backspace":
+            self.key_requested.emit("backspace", True)
+            return
+        if key == "Enter":
+            self.key_requested.emit("enter", True)
+            return
+        shifted_symbols = {
+            "1": "!", "2": "@", "3": "#", "4": "$", "5": "%",
+            "6": "^", "7": "&", "8": "*", "9": "(", "0": ")",
+            ".": ">", ",": "<",
+        }
+        if self._shifted and key in shifted_symbols:
+            character = shifted_symbols[key]
+        elif len(key) == 1 and key.isalpha() and (
+                self._shifted ^ getattr(self, "_caps_locked", False)):
+            character = key.upper()
+        else:
+            character = key
+        self.key_requested.emit(character, False)
+        if self._shifted:
+            self._shifted = False
+            self.shift_button.setChecked(False)
+
+
+class DwellFeedbackOverlay(QWidget):
+    """Visible progress ring that never intercepts clicks or focus."""
+
+    def __init__(self, parent=None):
+        flags = (Qt.WindowType.Tool | Qt.WindowType.FramelessWindowHint
+                 | Qt.WindowType.WindowStaysOnTopHint
+                 | Qt.WindowType.WindowDoesNotAcceptFocus)
+        super().__init__(parent, flags)
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.setFixedSize(48, 48)
+        self.progress = 0.0
+        self.hide_timer = QTimer(self)
+        self.hide_timer.setSingleShot(True)
+        self.hide_timer.timeout.connect(self.hide)
+
+    def show_progress(self, point, progress, scale=1.0):
+        self.progress = max(0.0, min(1.0, float(progress)))
+        if self.progress <= 0:
+            self.hide_timer.stop()
+            self.hide()
+            return
+        x, y = int(point[0] / scale), int(point[1] / scale)
+        self.move(x - self.width() // 2, y - self.height() // 2)
+        self.update()
+        self.show()
+        self.raise_()
+        if self.progress >= 1.0:
+            self.hide_timer.start(450)
+        else:
+            # A camera dropout or handoff must not leave a stale ring on screen.
+            # Live progress updates keep renewing this short lease.
+            self.hide_timer.start(700)
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        rect = self.rect().adjusted(4, 4, -4, -4)
+        painter.setPen(QPen(QColor(15, 28, 42, 190), 5))
+        painter.drawEllipse(rect)
+        painter.setPen(QPen(QColor("#58d6a5"), 4, Qt.PenStyle.SolidLine,
+                            Qt.PenCapStyle.RoundCap))
+        painter.drawArc(rect, 90 * 16, -int(self.progress * 360 * 16))
 
 
 class AccessFlowWindow(QMainWindow):
@@ -293,12 +451,15 @@ class AccessFlowWindow(QMainWindow):
         self._pending_start = False
         self._pending_calibration = False
         self._pending_preview = None
+        self._pending_pointer_event = None
         self._quitting = False
         self._calibration_in_flight = False
         self.running = False
-        self.calibration_notice = ""
+        self.calibration_notice = "Eye gaze input is disabled in this version."
         self.safety_warning = ""
-        self.gaze_transform = self._load_calibration()
+        # Retain the legacy calibration helpers for compatibility, but don't
+        # load or apply an old gaze mapping in the active input flow.
+        self.gaze_transform = None
         # Samples for the current target, and the accepted mean per target.
         self.calibration_buffer = deque(maxlen=30)
         self.calibration_points = {}
@@ -306,6 +467,10 @@ class AccessFlowWindow(QMainWindow):
         self.calibration_target_started = 0.0
         self.calibration_timer = QTimer(self)
         self.calibration_timer.timeout.connect(self._poll_calibration)
+        self.pointer_move_timer = QTimer(self)
+        self.pointer_move_timer.setSingleShot(True)
+        self.pointer_move_timer.setInterval(16)
+        self.pointer_move_timer.timeout.connect(self._flush_pointer_move)
         self.calibration_overlay = None
         self.download_worker = None
         self.preview_worker = None
@@ -315,6 +480,9 @@ class AccessFlowWindow(QMainWindow):
         self.resize(1120, 740)
         self.setMinimumSize(920, 620)
         self._build_ui()
+        self.accessflow_keyboard = AccessFlowKeyboard(self)
+        self.accessflow_keyboard.key_requested.connect(self._keyboard_key_requested)
+        self.dwell_feedback_overlay = DwellFeedbackOverlay(self)
         self._build_tray()
         self._restore_settings()
         self.esc_shortcut = QShortcut(QKeySequence("Esc"), self)
@@ -349,7 +517,7 @@ class AccessFlowWindow(QMainWindow):
 
         self.pages = QStackedWidget()
         self.nav_buttons = []
-        for index, name in enumerate(["Dashboard", "Input methods", "Calibration",
+        for index, name in enumerate(["Dashboard", "Input methods",
                                       "Tracking preview", "Accessibility", "About"]):
             button = QPushButton(name)
             button.setObjectName("nav")
@@ -366,8 +534,8 @@ class AccessFlowWindow(QMainWindow):
         # touched on the GUI thread.
         self.bus.status.connect(self.status_label.setText)
 
-        for page in (self._dashboard(), self._inputs(), self._calibration(),
-                     self._preview(), self._accessibility(), self._about()):
+        for page in (self._dashboard(), self._inputs(), self._preview(),
+                     self._accessibility(), self._about()):
             self.pages.addWidget(page)
         layout.addWidget(sidebar)
         layout.addWidget(self.pages, 1)
@@ -420,7 +588,7 @@ class AccessFlowWindow(QMainWindow):
         pause.clicked.connect(self._pause)
         box.addWidget(pause, 0, Qt.AlignmentFlag.AlignLeft)
 
-        note = QLabel("Camera tracking combines gaze, head, and hand input through one webcam owner. Voice recognition is local and needs an extracted Vosk model folder. Inputs start only when selected here.")
+        note = QLabel("Camera tracking combines head and hand input through one webcam owner. Voice recognition is local and needs an extracted Vosk model folder. Inputs start only when selected here.")
         note.setObjectName("notice")
         note.setWordWrap(True)
         self.dashboard_note = note
@@ -430,46 +598,55 @@ class AccessFlowWindow(QMainWindow):
 
     def _inputs(self):
         page, box = self._page("Input methods", "Select what AccessFlow should listen to when you start a session.")
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        content = QWidget()
+        content_layout = QVBoxLayout(content)
+        content_layout.setContentsMargins(0, 0, 12, 8)
+        content_layout.setSpacing(14)
+        scroll.setWidget(content)
+        box.addWidget(scroll, 1)
         self.input_checks = {}
         definitions = [
-            ("gaze", "Eye gaze", "Moves the pointer from calibrated eye direction. Selecting it turns Head tracking off. Calibrate first, then preview the mapping. The first-run face model downloads from MediaPipe."),
-            ("gestures", "Hand gestures", "Steer with your index finger like a trackpad and pinch to click. The pointer freezes when your hand leaves the frame, so it never jumps back across the screen."),
-            ("voice", "Voice commands and dictation", "Offline Vosk recognition; audio is processed locally."),
-            ("head", "Head tracking", "Moves the pointer from head movement relative to the neutral position learned at session start. Selecting it turns Eye gaze off. Uses the same face model as eye gaze.")
+            ("gestures", "Hand gestures", "Move with your index finger. Keep only the index fingertip still for a left-click dwell; your other fingers can be relaxed. Hold only index and middle fingers up for right click. Dwell restarts when Windows identifies a different control. Pinching does not click. If hand and face tracking are both enabled, the hand takes pointer priority while it is detected."),
+            ("voice", "Voice commands and dictation", "Say ‘left click’ or ‘right click’, ‘scroll up’ or ‘scroll down’, ‘open Notepad’ or ‘open Calculator’, or ‘pause AccessFlow’. For dictation, say ‘type’ followed by the words. Speech is processed locally; only Notepad and Calculator can be opened by voice."),
+            ("head", "Head tracking", "Moves the pointer from head movement relative to the neutral position learned at session start. Dwell over a control for the selected time to left-click; enable Voice for spoken right-click and other commands.")
         ]
         for key, title, detail in definitions:
             card = self._card(title, detail)
             check = QCheckBox("Enable")
-            check.toggled.connect(lambda checked, name=key: self._exclusive_camera_mode(name, checked))
             card.layout().addWidget(check)
             if key == "head":
                 recenter = QPushButton("Recenter head tracking")
                 recenter.clicked.connect(self._recenter_head)
                 card.layout().addWidget(recenter)
             self.input_checks[key] = check
-            box.addWidget(card)
+            content_layout.addWidget(card)
 
         voice_card = self._card("Offline voice model", "Choose the folder containing an extracted Vosk model, such as vosk-model-small-en-us-0.15.")
         row = QHBoxLayout()
         self.model_path = QLineEdit()
         self.model_path.setPlaceholderText("Select Vosk model folder")
         browse = QPushButton("Browse")
+        browse.setObjectName("secondaryAction")
+        browse.setMinimumHeight(42)
+        browse.setMinimumWidth(110)
         browse.clicked.connect(self._browse_model)
+        self.voice_browse_button = browse
         row.addWidget(self.model_path, 1)
         row.addWidget(browse)
         voice_card.layout().addLayout(row)
         download = QPushButton("Download small English model")
+        download.setObjectName("secondaryAction")
+        download.setMinimumHeight(42)
+        download.setMinimumWidth(220)
         download.clicked.connect(self._download_voice_model)
-        voice_card.layout().addWidget(download)
-        box.addWidget(voice_card)
-        box.addStretch()
+        self.download_button = download
+        voice_card.layout().addWidget(download, 0, Qt.AlignmentFlag.AlignLeft)
+        content_layout.addWidget(voice_card)
+        content_layout.addStretch()
         return page
-
-    def _exclusive_camera_mode(self, key, checked):
-        if not checked or key not in ("gaze", "head"):
-            return
-        other = "head" if key == "gaze" else "gaze"
-        self.input_checks[other].setChecked(False)
 
     def _recenter_head(self):
         if self.running and self.vision_worker and self.input_checks["head"].isChecked():
@@ -494,9 +671,10 @@ class AccessFlowWindow(QMainWindow):
         box.addWidget(self._card(
             "How it works",
             "AccessFlow samples your eye position while you look at each target "
-            "and fits a quadratic mapping, so the corners of the screen are not "
-            "short. The mapping is saved locally. Use Tracking preview to see "
-            "the mapped cursor before you use it on the desktop."))
+            "and compares affine and quadratic mappings using held-out target "
+            "error. It chooses the simpler mapping unless the quadratic fit "
+            "meaningfully improves your results. The mapping is saved locally. "
+            "Use Tracking preview to check it before desktop use."))
         box.addStretch()
         return page
 
@@ -553,11 +731,12 @@ class AccessFlowWindow(QMainWindow):
             return
         elapsed = time.monotonic() - self.calibration_target_started
         samples = np.asarray(self.calibration_buffer, dtype=float)
-        if len(samples) >= CALIBRATION_MIN_SAMPLES:
-            spread = float(np.max(np.std(samples, axis=0)))
+        if elapsed >= CALIBRATION_MIN_DWELL and len(samples) >= CALIBRATION_MIN_SAMPLES:
+            recent = samples[-min(len(samples), 30):]
+            spread = float(np.max(np.std(recent, axis=0)))
             if spread <= CALIBRATION_STABLE_STD:
                 self.calibration_points[self.calibration_target_index] = (
-                    float(np.mean(samples[:, 0])), float(np.mean(samples[:, 1])))
+                    float(np.mean(recent[:, 0])), float(np.mean(recent[:, 1])))
                 self.calibration_buffer.clear()
                 if self.calibration_target_index < len(self.calibration_overlay.targets) - 1:
                     self.calibration_target_index += 1
@@ -570,9 +749,15 @@ class AccessFlowWindow(QMainWindow):
                     self._finish_calibration()
                 return
         if elapsed > CALIBRATION_POINT_TIMEOUT:
+            if len(samples) < CALIBRATION_MIN_SAMPLES:
+                reason = "not enough valid eye readings; check camera framing and eye visibility"
+            else:
+                recent = samples[-CALIBRATION_MIN_SAMPLES:]
+                spread = float(np.max(np.std(recent, axis=0)))
+                reason = f"eye reading varied too much ({spread:.3f}); hold your gaze on the dot"
             self.calibration_status.setText(
                 f"Calibration stopped at point {self.calibration_target_index + 1}: "
-                "no steady eye reading. Hold your head still, face the camera, and try again.")
+                f"{reason}. Try again with your head still.")
             self._stop_calibration(keep_message=True)
 
     def _finish_calibration(self):
@@ -587,26 +772,43 @@ class AccessFlowWindow(QMainWindow):
                     raise ValueError(f"Point {index + 1} was never measured.")
                 features.append([point[0], point[1]])
                 screen_points.append([target_x, target_y])
-            # A quadratic fit bends the mapping at the edges. The reference
-            # Eye-To-Mouse project uses the same polynomial family; a plain
-            # affine fit systematically misses the corners on most eyes.
-            matrix, error = fit_gaze_mapping(
-                features, screen_points, GAZE_MODEL_QUADRATIC)
+            # Prefer the simpler affine map unless leave-one-out validation
+            # shows the quadratic meaningfully improves this user's data.
+            matrix, error, model, model_errors = fit_best_gaze_mapping(
+                features, screen_points)
             if error > CALIBRATION_MAX_ERROR:
+                detail = ", ".join(
+                    f"{name.removesuffix('_v1')} {value * 100:.0f}%"
+                    for name, value in model_errors.items())
+                predictions = leave_one_out_gaze_predictions(
+                    features, screen_points, model)
+                point_details = []
+                for index, (feature, target, prediction) in enumerate(
+                        zip(features, screen_points, predictions)):
+                    predicted = ("unavailable" if prediction is None else
+                                 f"{prediction[0]:.2f},{prediction[1]:.2f}")
+                    point_details.append(
+                        f"P{index + 1} gaze={feature[0]:.3f},{feature[1]:.3f} "
+                        f"target={target[0]:.2f},{target[1]:.2f} "
+                        f"predicted={predicted}")
                 raise ValueError(
-                    f"Calibration error too high ({error * 100:.0f}% of the screen). "
-                    "Improve lighting and try again.")
+                    f"Calibration readings did not form a reliable mapping "
+                    f"(held-out errors: {detail}). Keep looking at the center "
+                    "of each dot until it advances. Per-point details from "
+                    "the chosen fit: " + "; ".join(point_details))
             # Build the mapping completely before adopting it, so a failed
             # attempt never destroys a calibration that already worked.
             matrix_list = matrix.tolist()
             self.settings.setValue(CALIBRATION_KEY, json.dumps({
                 "feature": GAZE_FEATURE,
-                "model": GAZE_MODEL_QUADRATIC,
+                "model": model,
                 "screen": list(self.actions.screen_size()),
                 "matrix": matrix_list,
             }))
             self.gaze_transform = matrix_list
-            self.calibration_notice = f"Calibrated (fit error {error * 100:.1f}% of the screen)."
+            self.calibration_notice = (
+                f"Calibrated with {model.removesuffix('_v1')} mapping "
+                f"(held-out error {error * 100:.1f}%).")
             self.calibration_status.setText("Calibration saved! You can now start Eye gaze.")
         except Exception as exc:
             kept = " Your previous calibration was kept." if self.gaze_transform else ""
@@ -615,11 +817,17 @@ class AccessFlowWindow(QMainWindow):
             self._stop_calibration(keep_message=True)
 
     def _calibration_status(self, message):
-        if message == "Camera inputs active":
+        # VisionWorker includes the selected camera/backend in its ready
+        # message (for example, "Camera inputs active - Camera 0 (DirectShow)").
+        # Match the stable prefix so calibration starts sampling after the
+        # camera is ready instead of waiting forever for an obsolete exact
+        # string. CameraUnavailableError also includes troubleshooting detail,
+        # so its status must be matched by prefix as well.
+        if message.startswith("Camera inputs active"):
             self.calibration_target_started = time.monotonic()
             self.calibration_status.setText("Calibrating point 1 of 9… look at the red dot")
             self.calibration_timer.start(100)
-        elif message.startswith("Camera stopped") or message == "Camera unavailable":
+        elif message.startswith(("Camera stopped", "Camera unavailable")):
             self.calibration_status.setText(message)
             self._stop_calibration(keep_message=True)
 
@@ -645,6 +853,7 @@ class AccessFlowWindow(QMainWindow):
         try:
             data = json.loads(saved)
         except (TypeError, ValueError):
+            self.calibration_notice = "Saved calibration is unreadable; recalibrate."
             return None
         if isinstance(data, list):
             # Mapping saved before the screen size and feature were recorded.
@@ -658,18 +867,38 @@ class AccessFlowWindow(QMainWindow):
             self.calibration_notice = "Saved calibration used an older gaze feature; recalibrate."
             return None
         recorded = data.get("screen")
-        if recorded and list(recorded) != list(self.actions.screen_size()):
+        if recorded:
+            try:
+                recorded_size = list(recorded)
+            except TypeError:
+                self.calibration_notice = "Saved calibration screen size is unreadable; recalibrate."
+                return None
+            if recorded_size != list(self.actions.screen_size()):
+                self.calibration_notice = (
+                    "Saved calibration was made for a different screen size; recalibrate.")
+                return None
+        if not recorded:
             self.calibration_notice = (
-                "Saved calibration was made for a different screen size; recalibrate.")
-            return None
+                "Saved calibration has no screen-size record; recalibrate to verify it.")
         matrix = _valid_gaze_matrix(data.get("matrix"))
         if matrix is None:
             self.calibration_notice = "Saved calibration is unreadable; recalibrate."
-        elif data.get("model") != GAZE_MODEL_QUADRATIC or len(matrix) == 3:
-            # Still usable, but the linear fit misses the screen corners.
-            self.calibration_notice = (
-                "Saved calibration uses the older linear mapping. Recalibrate "
-                "for better accuracy near the screen edges.")
+        else:
+            matrix_model = model_for_matrix(matrix)
+            stored_model = data.get("model")
+            if stored_model is None:
+                self.calibration_notice = (
+                    f"Saved eye calibration loaded as {matrix_model.removesuffix('_v1')}; "
+                    "model metadata was not recorded.")
+            elif stored_model not in (GAZE_MODEL_AFFINE, GAZE_MODEL_QUADRATIC):
+                self.calibration_notice = "Saved calibration model is unsupported; recalibrate."
+                return None
+            elif stored_model != matrix_model:
+                self.calibration_notice = "Saved calibration model is inconsistent; recalibrate."
+                return None
+            elif not self.calibration_notice:
+                self.calibration_notice = (
+                    f"Saved {stored_model.removesuffix('_v1')} eye calibration loaded.")
         return matrix
 
     def _preview(self):
@@ -679,8 +908,7 @@ class AccessFlowWindow(QMainWindow):
             "the pointer. Preview never moves the real pointer, so it is safe to "
             "experiment before starting a session.")
         row = QHBoxLayout()
-        for mode, label in (("hand", "Hand preview"), ("gaze", "Eye preview"),
-                            ("head", "Head preview")):
+        for mode, label in (("hand", "Hand preview"), ("head", "Head preview")):
             button = QPushButton(label)
             button.clicked.connect(
                 lambda checked=False, m=mode: self._start_preview(m))
@@ -706,10 +934,8 @@ class AccessFlowWindow(QMainWindow):
         return page
 
     def _start_preview(self, mode):
-        if mode not in ("hand", "gaze", "head"):
+        if mode not in ("hand", "head"):
             return
-        if self.calibration_overlay is not None:
-            self._stop_calibration()
         if self.running:
             self._pause()
         if self.preview_worker is not None:
@@ -721,11 +947,11 @@ class AccessFlowWindow(QMainWindow):
         pointer_width, pointer_height = self.actions.screen_size()
         self.preview_worker = VisionWorker(
             pointer_width, pointer_height,
-            gaze_enabled=(mode == "gaze"),
+            gaze_enabled=False,
             gestures_enabled=(mode == "hand"),
-            gaze_transform=self.gaze_transform if mode == "gaze" else None,
             head_enabled=(mode == "head"),
-            preview=mode)
+            preview=mode,
+            dwell_ms=self.dwell_slider.value())
         self.preview_worker.preview_ready.connect(self.preview_widget.set_payload)
         self.preview_worker.status.connect(self._preview_status)
         self.preview_worker.finished.connect(self._on_worker_finished)
@@ -735,13 +961,16 @@ class AccessFlowWindow(QMainWindow):
         hints = {
             "hand": ("Move your index finger like a trackpad. The mapping is "
                      "relative: the cursor moves with the finger's movement, not "
-                     "to where the finger points. Pinch thumb and index to click."),
-            "gaze": ("Look around the screen. Calibrated eye gaze maps absolute "
-                     "screen position; if the note says not calibrated, run the "
-                     "nine-point calibration first."),
+                     "to where the finger points. This preview checks pointer "
+                     "movement only and never arms or performs clicks. In a live "
+                     "session, keep only your index fingertip still for left "
+                     "click, or hold only index and middle fingers up for right "
+                     "click. Pinching does not click."),
             "head": ("Move your head left/right/up/down. The first frames learn "
-                     "your neutral position; so do not move while the preview "
-                     "settles."),
+                     "your neutral position; stay still while the preview "
+                     "settles. Hold the pointer within a small area for the "
+                     "selected dwell time to left-click. The preview timer never "
+                     "clicks."),
         }
         self.preview_hint.setText(hints[mode])
         self.preview_status.setText("Starting camera…")
@@ -766,16 +995,35 @@ class AccessFlowWindow(QMainWindow):
         self.download_worker = VoiceModelDownloadWorker()
         self.download_worker.status.connect(self.status_label.setText)
         self.download_worker.completed.connect(self._voice_model_downloaded)
-        self.download_worker.failed.connect(lambda message: QMessageBox.warning(self, "Model download failed", message))
+        self.download_worker.failed.connect(self._voice_model_download_failed)
+        self.download_button.setEnabled(False)
         self.download_worker.start()
 
     def _voice_model_downloaded(self, path):
+        self.download_button.setEnabled(not self.running)
         self.model_path.setText(path)
         self.status_label.setText("Offline voice model ready")
 
+    def _voice_model_download_failed(self, message):
+        self.download_button.setEnabled(not self.running)
+        QMessageBox.warning(self, "Model download failed", message)
+
     def _accessibility(self):
         page, box = self._page("Accessibility", "Settings are stored locally on this computer.")
-        dwell = self._card("Dwell duration", "Target dwell time for future gaze selection.")
+        keyboard = self._card(
+            "On-screen keyboard",
+            "Start an input session, open AccessFlow’s keyboard, then dwell on the text field in the app you want to type into and on keyboard keys. The timer shows progress and restarts when Windows identifies a different control. The keyboard stays on top without taking text focus.")
+        open_keyboard = QPushButton("Open AccessFlow Keyboard")
+        open_keyboard.setObjectName("secondaryAction")
+        open_keyboard.setMinimumHeight(42)
+        open_keyboard.clicked.connect(self._show_accessflow_keyboard)
+        keyboard.layout().addWidget(open_keyboard)
+        windows_keyboard = QPushButton("Try Windows On-Screen Keyboard")
+        windows_keyboard.setMinimumHeight(38)
+        windows_keyboard.clicked.connect(self._open_onscreen_keyboard)
+        keyboard.layout().addWidget(windows_keyboard)
+        box.addWidget(keyboard)
+        dwell = self._card("Dwell selection", "Hand: keep only your index fingertip still for a left click; your other fingers can be relaxed. For right click, raise only index and middle fingers and keep the index fingertip still. Pinching does not click. Head tracking: hold the pointer over a control for a left click. When Windows exposes the control, dwell follows that target and restarts if it changes; otherwise it uses a small screen area. The timer below applies to hand and head. Enable Voice to say ‘left click’ or ‘right click’ with any pointer method.")
         value = QLabel("1200 ms")
         self.dwell_slider = QSlider(Qt.Orientation.Horizontal)
         self.dwell_slider.setRange(500, 3000)
@@ -789,6 +1037,70 @@ class AccessFlowWindow(QMainWindow):
         box.addWidget(self._card("Privacy", "Webcam frames and microphone audio are processed locally and are not recorded by AccessFlow."))
         box.addStretch()
         return page
+
+    def _show_accessflow_keyboard(self):
+        keyboard = self.accessflow_keyboard
+        screen = QApplication.primaryScreen().availableGeometry()
+        keyboard.adjustSize()
+        keyboard.move(
+            screen.left() + max(0, (screen.width() - keyboard.width()) // 2),
+            screen.bottom() - keyboard.height() - 24)
+        keyboard.show()
+        keyboard.raise_()
+        if self.running and not self.engine.paused:
+            self.status_label.setText("AccessFlow keyboard ready · select a text field, then a key")
+        else:
+            self.status_label.setText("Keyboard open · start an input session before typing")
+
+    def _keyboard_key_requested(self, value, is_key):
+        if not self.running or self.engine.paused:
+            self.status_label.setText("Start an input session before typing with this keyboard")
+            return
+        if is_key:
+            self.action_executor.submit(self.actions.press_key, {"key": value})
+        else:
+            self.action_executor.submit(self.actions.type_text, {"text": value})
+
+    def _show_dwell_feedback(self, payload):
+        screen = QApplication.primaryScreen()
+        scale = screen.devicePixelRatio() if screen is not None else 1.0
+        self.dwell_feedback_overlay.show_progress(
+            payload.get("point", (0, 0)), payload.get("progress", 0.0), scale)
+
+    def _open_onscreen_keyboard(self):
+        keyboard_path = Path(os.environ.get("WINDIR", r"C:\Windows")) / "System32" / "osk.exe"
+        touch_keyboard_path = (
+            Path(os.environ.get("ProgramFiles", r"C:\Program Files"))
+            / "Common Files" / "Microsoft Shared" / "Ink" / "TabTip.exe")
+        try:
+            if not keyboard_path.is_file():
+                raise FileNotFoundError(f"Windows On-Screen Keyboard was not found at {keyboard_path}")
+            subprocess.Popen([str(keyboard_path)])
+            self.status_label.setText("Windows On-Screen Keyboard opened")
+        except OSError as exc:
+            if getattr(exc, "winerror", None) == 740:
+                self.status_label.setText("Windows blocked the on-screen keyboard (elevation required)")
+                QMessageBox.information(
+                    self, "Windows blocked the on-screen keyboard",
+                    "Windows requires elevation to open its built-in on-screen keyboard on this computer. "
+                    "AccessFlow runs without administrator privileges and cannot safely bypass that Windows policy.\n\n"
+                    "Open Settings → Accessibility → Keyboard and turn on On-Screen Keyboard. "
+                    "If Windows shows the same elevation message there, ask your device administrator to enable it."
+                )
+                return
+            try:
+                if not touch_keyboard_path.is_file():
+                    raise FileNotFoundError(
+                        f"Windows Touch Keyboard was not found at {touch_keyboard_path}")
+                subprocess.Popen([str(touch_keyboard_path)])
+                self.status_label.setText(
+                    "Classic On-Screen Keyboard was blocked; Windows Touch Keyboard opened")
+            except OSError as fallback_error:
+                QMessageBox.warning(
+                    self, "On-Screen Keyboard unavailable",
+                    f"Windows could not open the classic keyboard: {exc}\n\n"
+                    f"The Windows Touch Keyboard fallback also failed: {fallback_error}\n\n"
+                    "AccessFlow does not request administrator privileges. Open Settings → Accessibility → Keyboard and turn on On-Screen Keyboard.")
 
     def _about(self):
         page, box = self._page("About AccessFlow", "Adaptive multimodal assistive computer interaction.")
@@ -810,7 +1122,7 @@ class AccessFlowWindow(QMainWindow):
         self.tray.setToolTip("AccessFlow")
         menu = QMenu()
         show = QAction("Open AccessFlow", self)
-        show.triggered.connect(self.showNormal)
+        show.triggered.connect(self._show_from_tray)
         toggle = QAction("Start / pause inputs", self)
         toggle.triggered.connect(self._toggle_running)
         exit_action = QAction("Exit", self)
@@ -820,9 +1132,19 @@ class AccessFlowWindow(QMainWindow):
         menu.addSeparator()
         menu.addAction(exit_action)
         self.tray.setContextMenu(menu)
-        self.tray.activated.connect(lambda reason: self.showNormal() if reason == QSystemTrayIcon.ActivationReason.Trigger else None)
+        self.tray.activated.connect(self._tray_activated)
         if QSystemTrayIcon.isSystemTrayAvailable():
             self.tray.show()
+
+    def _show_from_tray(self):
+        self.showNormal()
+        self.raise_()
+        self.activateWindow()
+
+    def _tray_activated(self, reason):
+        if reason in (QSystemTrayIcon.ActivationReason.Trigger,
+                      QSystemTrayIcon.ActivationReason.DoubleClick):
+            self._show_from_tray()
 
     def _restore_settings(self):
         for key, check in self.input_checks.items():
@@ -834,9 +1156,19 @@ class AccessFlowWindow(QMainWindow):
         self.dwell_slider.valueChanged.connect(lambda value: self.settings.setValue("accessibility/dwell_ms", value))
 
     def _browse_model(self):
-        path = QFileDialog.getExistingDirectory(self, "Select extracted Vosk model folder")
-        if path:
-            self.model_path.setText(path)
+        start_dir = self.model_path.text().strip()
+        if not Path(start_dir).is_dir():
+            start_dir = str(Path.home())
+        dialog = QFileDialog(self, "Select extracted Vosk model folder", start_dir)
+        dialog.setFileMode(QFileDialog.FileMode.Directory)
+        dialog.setOption(QFileDialog.Option.ShowDirsOnly, True)
+        # Avoid native shell dialogs, which can block the Qt event loop on
+        # systems where the shell's folder picker hangs or fails to initialize.
+        dialog.setOption(QFileDialog.Option.DontUseNativeDialog, True)
+        if dialog.exec() == QFileDialog.DialogCode.Accepted:
+            selected = dialog.selectedFiles()
+            if selected:
+                self.model_path.setText(selected[0])
 
     def _toggle_running(self):
         if self.running:
@@ -852,40 +1184,64 @@ class AccessFlowWindow(QMainWindow):
             self._pending_start = True
             self.status_label.setText("Waiting for previous inputs to stop…")
             return
-        gaze = self.input_checks["gaze"].isChecked()
         gestures = self.input_checks["gestures"].isChecked()
         voice = self.input_checks["voice"].isChecked()
         head = self.input_checks["head"].isChecked()
-        model_path = Path(self.model_path.text().strip())
-        if voice and not model_path.is_dir():
-            QMessageBox.warning(self, "Vosk model required", "Select an extracted Vosk model folder before enabling voice input.")
+        if not any((gestures, voice, head)):
+            QMessageBox.information(
+                self, "Select an input method",
+                "Enable at least one input method before starting a session.")
             return
+        model_path = Path(self.model_path.text().strip())
+        voice_skipped = voice and not model_path.is_dir()
+        if voice_skipped:
+            voice = False
         sources = []
-        if gaze:
-            sources.append("gaze")
         if gestures:
             sources.append("gestures")
         if voice:
             sources.append("voice")
         if head:
             sources.append("head")
-        # Each input starts independently. A missing eye calibration only
-        # blocks gaze, not hand/head.
+        notices = []
+        if voice_skipped:
+            notices.append("Voice needs an extracted Vosk model folder")
+        if not sources:
+            if notices:
+                QMessageBox.information(
+                    self, "Input setup needed", "; ".join(notices) + ".")
+                return
+            QMessageBox.information(
+                self, "Select an input method",
+                "No usable input method is selected. Enable hand, head, or voice input.")
+            return
+        if notices:
+            QMessageBox.information(
+                self, "Some inputs will be skipped",
+                "; ".join(notices) + ". Other selected methods will start.")
+        # Each selected provider starts independently; camera tracking serves
+        # the selected head and/or hand inputs through one worker.
         self._active = True
         self.engine.start(sources)
         self.running = True
+        self._set_input_controls_enabled(False)
         self.start_button.setText("Pause inputs")
-        self.status_label.setText("Active" if sources else "Active · no inputs")
+        self.status_label.setText("Active")
         self.session_card.layout().itemAt(0).widget().setText("Session active")
-        self.session_card.layout().itemAt(1).widget().setText(", ".join(sources) if sources else "No input methods selected")
+        source_summary = ", ".join(sources)
+        if voice_skipped:
+            source_summary += " · Voice skipped (model required)"
+        self.session_card.layout().itemAt(1).widget().setText(source_summary)
 
-        if gaze or gestures or head:
+        if gestures or head:
             pointer_width, pointer_height = self.actions.screen_size()
             self.vision_worker = VisionWorker(
-                pointer_width, pointer_height, gaze, gestures,
-                gaze_transform=self.gaze_transform, head_enabled=head)
+                pointer_width, pointer_height, gaze_enabled=False,
+                gestures_enabled=gestures, head_enabled=head,
+                dwell_ms=self.dwell_slider.value())
             self.vision_worker.event_ready.connect(self._on_event)
             self.vision_worker.status.connect(self.status_label.setText)
+            self.vision_worker.dwell_feedback.connect(self._show_dwell_feedback)
             self.vision_worker.start()
         if voice:
             self.voice_worker = VoiceWorker(str(model_path))
@@ -893,20 +1249,42 @@ class AccessFlowWindow(QMainWindow):
             self.voice_worker.status.connect(self.status_label.setText)
             self.voice_worker.start()
 
-            self.vision_worker.event_ready.connect(self._on_event)
-            self.vision_worker.status.connect(self.status_label.setText)
-            self.vision_worker.start()
-        if voice:
-            self.voice_worker = VoiceWorker(str(model_path))
-            self.voice_worker.event_ready.connect(self._on_event)
-            self.voice_worker.status.connect(self.status_label.setText)
-            self.voice_worker.start()
+    def _set_input_controls_enabled(self, enabled):
+        """Keep displayed settings aligned with the running worker settings."""
+        for check in self.input_checks.values():
+            check.setEnabled(enabled)
+        self.model_path.setEnabled(enabled)
+        self.voice_browse_button.setEnabled(enabled)
+        self.download_button.setEnabled(
+            enabled and not (self.download_worker and self.download_worker.isRunning()))
+        self.dwell_slider.setEnabled(enabled)
 
     def _on_event(self, event):
         if event.action == "pause":
             self._pause()
             return
+        if event.action == "move_pointer":
+            if not self.running:
+                return
+            # Camera workers can emit a move every frame. Keep only the newest
+            # point and apply it on a short UI timer instead of replaying an
+            # increasingly stale trail if the GUI thread falls behind.
+            self._pending_pointer_event = event
+            if not self.pointer_move_timer.isActive():
+                self.pointer_move_timer.start()
+            return
+        if self._pending_pointer_event is not None:
+            # Apply the latest position before clicks or other actions that
+            # depend on where the cursor currently is.
+            self.pointer_move_timer.stop()
+            self._flush_pointer_move()
         self.engine.dispatch(event)
+
+    def _flush_pointer_move(self):
+        event = self._pending_pointer_event
+        self._pending_pointer_event = None
+        if event is not None and self.running:
+            self.engine.dispatch(event)
 
     def _report_error(self, message):
         """Show a failed action instead of discarding it silently.
@@ -925,7 +1303,8 @@ class AccessFlowWindow(QMainWindow):
         with warnings.catch_warnings():
             # PySide warns when disconnecting a signal that has no listeners.
             warnings.simplefilter("ignore", RuntimeWarning)
-            for name in ("status", "event_ready", "gaze_sample", "preview_ready"):
+            for name in ("status", "event_ready", "gaze_sample", "preview_ready",
+                         "dwell_feedback", "completed", "failed"):
                 signal = getattr(worker, name, None)
                 if signal is not None:
                     try:
@@ -978,7 +1357,12 @@ class AccessFlowWindow(QMainWindow):
         self._pending_start = False
         self._pending_calibration = False
         self._pending_preview = None
+        self._pending_pointer_event = None
+        self.pointer_move_timer.stop()
+        self.dwell_feedback_overlay.hide_timer.stop()
+        self.dwell_feedback_overlay.hide()
         self.running = False
+        self._set_input_controls_enabled(True)
         self.start_button.setText("Start selected inputs")
         self.status_label.setText("Paused")
         self.session_card.layout().itemAt(0).widget().setText("Session paused")
@@ -988,8 +1372,6 @@ class AccessFlowWindow(QMainWindow):
 
     def _active_input(self, key):
         """Return True when an input method is enabled for the session."""
-        if key == "gaze":
-            return self.input_checks["gaze"].isChecked()
         if key == "head":
             return self.input_checks["head"].isChecked()
         if key == "gestures":
@@ -1025,6 +1407,8 @@ class AccessFlowWindow(QMainWindow):
         # Real mouse/touchpad movement: let the camera pointer step aside briefly.
         if self.running and self.vision_worker is not None:
             self.vision_worker.suspend_pointer()
+            self.dwell_feedback_overlay.hide_timer.stop()
+            self.dwell_feedback_overlay.hide()
 
     def _stop_global_listeners(self):
         for listener in (self.esc_listener, self.pointer_listener):
@@ -1035,6 +1419,10 @@ class AccessFlowWindow(QMainWindow):
         # Stop observing input before any deferred shutdown begins.
         self._stop_global_listeners()
         self._pause()
+        if self.download_worker is not None:
+            worker = self.download_worker
+            self.download_worker = None
+            self._retire_worker(worker)
         # _pause() cancels queued work; joining here keeps the process from
         # exiting halfway through a keystroke (which can leave a modifier held).
         self.action_executor.stop()
@@ -1054,6 +1442,8 @@ class AccessFlowWindow(QMainWindow):
     def closeEvent(self, event):
         if self.tray.isVisible():
             self._pause()
+            self.accessflow_keyboard.hide()
+            self.dwell_feedback_overlay.hide()
             self.hide()
             event.ignore()
         else:
@@ -1081,6 +1471,9 @@ def main():
         #cardText { color: #617487; }
         QPushButton { padding: 10px 16px; border: 1px solid #ccd7e2; border-radius: 8px; background: white; }
         QPushButton:hover { background: #edf4fa; }
+        QPushButton:checked { background: #d8e8f4; border-color: #8faec7; }
+        QPushButton#secondaryAction { background: #e8f1f8; color: #163c5b; border: 1px solid #b8cad9; font-weight: 600; }
+        QPushButton#secondaryAction:hover { background: #d8e8f4; }
         #primary { background: #1769aa; color: white; border: 0; font-weight: 650; }
         #primary:hover { background: #0f568f; }
         #notice { background: #eaf3fb; color: #315978; padding: 14px; border-radius: 8px; }
