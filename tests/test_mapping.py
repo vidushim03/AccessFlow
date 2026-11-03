@@ -329,12 +329,24 @@ class HandDwellTests(unittest.TestCase):
         self.assertEqual(len(events), 1)
         self.assertEqual(events[0].payload["button"], "right")
 
-    def test_curled_middle_finger_cannot_turn_index_dwell_into_right_click(self):
+    def test_right_click_accepts_tilted_middle_finger(self):
         worker, events = self.make_worker()
         points = self.landmarks("two_fingers")
-        # Wrist distance alone sees this middle fingertip as raised, but its
-        # local joint direction shows a curl. It must stay a left click.
+        # This angle is below the old strict extension threshold, but still a
+        # raised middle finger in the wrist-based V pose.
         points[12] = SimpleNamespace(x=0.73, y=0.32)
+        worker._hand_tracking(points, 1.0, True)
+        worker._hand_tracking(points, 1.3, True)
+        worker._hand_tracking(points, 1.8, True)
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0].payload["button"], "right")
+
+    def test_clearly_curled_middle_does_not_trigger_right_click(self):
+        worker, events = self.make_worker()
+        points = self.landmarks("two_fingers")
+        # A long sideways/curl landmark can fool the wrist-distance check;
+        # local joint direction rejects that false V pose.
+        points[12] = SimpleNamespace(x=0.95, y=0.65)
         worker._hand_tracking(points, 1.0, True)
         worker._hand_tracking(points, 1.3, True)
         worker._hand_tracking(points, 1.8, True)

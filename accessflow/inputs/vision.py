@@ -662,7 +662,7 @@ class VisionWorker(QThread):
                 self.dwell_candidate_button = None
                 self.dwell_cooldown_until = 0.0
                 self.dwell_candidate_at = now
-                self.dwell_candidate_button = self._hand_dwell_button(pose)
+                self.dwell_candidate_button = self._hand_dwell_button(pose, points)
                 self.dwell_pointer_anchor = None
             else:
                 # Keep steering available after a click. The latch blocks a
@@ -722,7 +722,7 @@ class VisionWorker(QThread):
 
         # Left click depends only on index-tip stability; the other fingers
         # may be relaxed or curled. Reserve two raised fingers for right click.
-        button = self._hand_dwell_button(pose)
+        button = self._hand_dwell_button(pose, points)
         if now < self.dwell_cooldown_until:
             if pointer_active:
                 self.dwell_feedback.emit({"point": (cursor[0] * (self.width - 1),
@@ -792,18 +792,28 @@ class VisionWorker(QThread):
                  if self.dwell_armed else "Move index to steer")
         return cursor, label
 
-    def _hand_dwell_button(self, pose):
+    def _hand_dwell_button(self, pose, points):
         """Choose one click button from independent pose checks.
 
-        A wrist-distance estimate alone can mistake a curled middle finger for
-        an extended one. Confirm the local middle-finger extension before
-        allowing a right click; index-only dwell always remains left click.
+        The wrist-distance V-pose classifier is the earlier behavior that
+        worked for this user. Confirm the middle finger is not curled, while
+        allowing a much wider angle than the left-click extension test so a
+        tilted V pose does not get downgraded to left click.
         """
         if self.hand_pinched:
             return None
-        if (pose == "two_fingers"
-                and self.hand_finger_extended["middle"]):
-            return "right"
+        if pose == "two_fingers":
+            mcp, pip, tip = points[9], points[10], points[12]
+            proximal = (pip.x - mcp.x, pip.y - mcp.y)
+            distal = (tip.x - pip.x, tip.y - pip.y)
+            proximal_length = math.hypot(*proximal)
+            distal_length = math.hypot(*distal)
+            if proximal_length > 1e-4 and distal_length > 1e-4:
+                alignment = ((proximal[0] * distal[0]
+                              + proximal[1] * distal[1])
+                             / (proximal_length * distal_length))
+                if alignment >= 0.10 and distal_length / proximal_length >= 0.20:
+                    return "right"
         if self.hand_finger_extended["index"]:
             return "left"
         return None
