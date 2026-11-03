@@ -125,7 +125,7 @@ class VoiceWorker(QThread):
                 self.status.emit("Left-click phrase was unclear; please repeat ‘left click’")
                 return
             self.event_ready.emit(InteractionEvent(
-                "voice", "command", "click_target", round(average, 3),
+                "voice", "command", "click", round(average, 3),
                 {"button": "left"}))
             return
         if confidence < COMMAND_MIN_CONFIDENCE:

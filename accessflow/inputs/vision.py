@@ -625,8 +625,7 @@ class VisionWorker(QThread):
             self.dwell_feedback.emit({"point": point, "progress": progress})
         if clicked and not self.preview:
             self.event_ready.emit(InteractionEvent(
-                source, "dwell", "click_target", 0.90, {
-                    "button": "left", "x": int(point[0]), "y": int(point[1])}))
+                source, "dwell", "click", 0.90, {"button": "left"}))
         return progress, clicked
 
     def _hand_tracking(self, points, now, pointer_active):

@@ -172,10 +172,10 @@ class VoicePhraseTests(unittest.TestCase):
         self.worker.event_ready.connect(self.events.append)
         self.worker.status.connect(self.statuses.append)
 
-    def test_left_click_uses_target_activation(self):
+    def test_left_click_uses_direct_mouse_click(self):
         self.worker._phrase("left click", 0.9, average=0.8)
         self.assertEqual(len(self.events), 1)
-        self.assertEqual(self.events[0].action, "click_target")
+        self.assertEqual(self.events[0].action, "click")
         self.assertEqual(self.events[0].payload["button"], "left")
 
     def test_unclear_left_click_is_rejected(self):
