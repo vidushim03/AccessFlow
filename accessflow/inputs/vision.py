@@ -662,9 +662,7 @@ class VisionWorker(QThread):
                 self.dwell_candidate_button = None
                 self.dwell_cooldown_until = 0.0
                 self.dwell_candidate_at = now
-                self.dwell_candidate_button = (
-                    None if self.hand_pinched else
-                    "right" if pose == "two_fingers" else "left")
+                self.dwell_candidate_button = self._hand_dwell_button(pose)
                 self.dwell_pointer_anchor = None
             else:
                 # Keep steering available after a click. The latch blocks a
@@ -724,18 +722,7 @@ class VisionWorker(QThread):
 
         # Left click depends only on index-tip stability; the other fingers
         # may be relaxed or curled. Reserve two raised fingers for right click.
-        index_extended = self.hand_finger_extended["index"]
-        if self.hand_pinched:
-            button = None
-        elif pose == "two_fingers":
-            # A confirmed V pose is sufficient for right click. Do not gate it
-            # on the independent index-only left-click classifier; hand tilt
-            # can make that classifier disagree with the pose detector.
-            button = "right"
-        elif index_extended:
-            button = "left"
-        else:
-            button = None
+        button = self._hand_dwell_button(pose)
         if now < self.dwell_cooldown_until:
             if pointer_active:
                 self.dwell_feedback.emit({"point": (cursor[0] * (self.width - 1),
@@ -804,6 +791,22 @@ class VisionWorker(QThread):
         label = (f"Hold still for {self.next_dwell_button} click"
                  if self.dwell_armed else "Move index to steer")
         return cursor, label
+
+    def _hand_dwell_button(self, pose):
+        """Choose one click button from independent pose checks.
+
+        A wrist-distance estimate alone can mistake a curled middle finger for
+        an extended one. Confirm the local middle-finger extension before
+        allowing a right click; index-only dwell always remains left click.
+        """
+        if self.hand_pinched:
+            return None
+        if (pose == "two_fingers"
+                and self.hand_finger_extended["middle"]):
+            return "right"
+        if self.hand_finger_extended["index"]:
+            return "left"
+        return None
 
     def _hand_pose(self, points):
         """Classify fingers from local joint direction with hysteresis.

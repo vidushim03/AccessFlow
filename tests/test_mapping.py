@@ -329,6 +329,18 @@ class HandDwellTests(unittest.TestCase):
         self.assertEqual(len(events), 1)
         self.assertEqual(events[0].payload["button"], "right")
 
+    def test_curled_middle_finger_cannot_turn_index_dwell_into_right_click(self):
+        worker, events = self.make_worker()
+        points = self.landmarks("two_fingers")
+        # Wrist distance alone sees this middle fingertip as raised, but its
+        # local joint direction shows a curl. It must stay a left click.
+        points[12] = SimpleNamespace(x=0.73, y=0.32)
+        worker._hand_tracking(points, 1.0, True)
+        worker._hand_tracking(points, 1.3, True)
+        worker._hand_tracking(points, 1.8, True)
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0].payload["button"], "left")
+
     def test_ambiguous_outer_fingers_do_not_turn_left_dwell_into_right(self):
         worker, events = self.make_worker()
         points = self.landmarks("two_fingers")
