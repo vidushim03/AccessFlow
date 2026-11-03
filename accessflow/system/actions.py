@@ -134,6 +134,40 @@ class WindowsActions:
         if x is None or y is None:
             x, y = pyautogui.position()
         x, y = int(x), int(y)
+        # The AccessFlow keyboard is a non-activating Qt tool window. Use a
+        # real mouse click for its key buttons so Qt receives the normal
+        # pressed/released sequence and emits ``key_requested``. UIA Invoke
+        # can report success on some Qt versions without delivering that
+        # sequence to the button.
+        if button == "left":
+            candidate = None
+            try:
+                from pywinauto import Desktop
+
+                candidate = Desktop(backend="uia").from_point(x, y)
+                ancestor = candidate
+                for _ in range(12):
+                    info = ancestor.element_info
+                    if (info.control_type == "Window"
+                            and (info.name or "").strip().casefold()
+                            == "accessflow keyboard"):
+                        pyautogui.click(x=x, y=y, button=button)
+                        return
+                    ancestor = ancestor.parent()
+                    if ancestor is None:
+                        break
+            except Exception as exc:
+                logger.debug("Keyboard target lookup failed: %s", exc)
+
+            # A dwell on a text-editing surface must place the caret. Invoke
+            # is not a focus/caret action, even when UIA says it succeeded.
+            try:
+                if candidate is not None and candidate.element_info.control_type in {
+                        "Document", "Edit"}:
+                    pyautogui.click(x=x, y=y, button=button)
+                    return
+            except Exception:
+                pass
         if button == "left":
             try:
                 from pywinauto import Desktop
