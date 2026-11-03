@@ -138,10 +138,13 @@ class HandDwellTests(unittest.TestCase):
     def landmarks(pose="open", index=(0.5, 0.3), pinch=False):
         points = [SimpleNamespace(x=0.5, y=0.6) for _ in range(21)]
         points[0] = SimpleNamespace(x=0.5, y=0.8)
-        for tip, pip in ((8, 6), (12, 10), (16, 14), (20, 18)):
+        for mcp, pip, tip in ((5, 6, 8), (9, 10, 12),
+                              (13, 14, 16), (17, 18, 20)):
             up = pose == "open" or (pose == "two_fingers" and tip in (8, 12))
-            points[pip] = SimpleNamespace(x=0.5, y=0.4 if up else 0.65)
-            points[tip] = SimpleNamespace(x=0.5, y=0.2 if up else 0.68)
+            x = 0.4 + (mcp - 5) * 0.02
+            points[mcp] = SimpleNamespace(x=x, y=0.62)
+            points[pip] = SimpleNamespace(x=x, y=0.42)
+            points[tip] = SimpleNamespace(x=x, y=0.22 if up else 0.65)
         points[8] = SimpleNamespace(x=index[0], y=index[1])
         points[4] = (SimpleNamespace(x=index[0], y=index[1]) if pinch else
                      SimpleNamespace(x=0.5, y=0.6))
@@ -173,6 +176,21 @@ class HandDwellTests(unittest.TestCase):
         self.assertFalse(worker.dwell_locked)
         self.assertEqual(len(events), 1)
 
+    def test_small_index_jitter_does_not_restart_dwell(self):
+        worker, events = self.make_worker(dwell_ms=500)
+        worker._hand_tracking(self.landmarks("open"), 1.0, True)
+        worker._hand_tracking(self.landmarks("open"), 1.3, True)
+        self.assertTrue(worker.dwell_armed)
+
+        # Typical small landmark wobble within the dwell radius should be
+        # tolerated instead of restarting the countdown on every frame.
+        for frame, offset in enumerate((0.008, -0.008, 0.010, -0.009, 0.006)):
+            worker._hand_tracking(
+                self.landmarks("open", index=(0.5 + offset, 0.3)),
+                1.41 + frame * 0.1, True)
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0].payload["button"], "left")
+
     def test_slow_finger_motion_cancels_an_armed_click(self):
         worker, events = self.make_worker(dwell_ms=500)
         worker._hand_tracking(self.landmarks("open"), 1.0, True)
@@ -183,7 +201,7 @@ class HandDwellTests(unittest.TestCase):
         # fingertip and still fire. A fixed anchor must cancel the click.
         for step in range(1, 9):
             worker._hand_tracking(
-                self.landmarks("open", index=(0.5 + step * 0.002, 0.3)),
+                self.landmarks("open", index=(0.5 + step * 0.004, 0.3)),
                 1.3 + step * 0.07, True)
         self.assertFalse(worker.dwell_armed)
         self.assertEqual(events, [])
@@ -226,7 +244,36 @@ class HandDwellTests(unittest.TestCase):
         worker._hand_tracking(points, 1.6, True)
         worker._hand_tracking(points, 1.9, True)
         self.assertEqual(events, [])
-        worker._hand_tracking(points, 2.4, True)
+        worker._hand_tracking(points, 2.66, True)
+        worker._hand_tracking(points, 3.17, True)
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0].payload["button"], "left")
+
+    def test_transient_control_hit_test_does_not_restart_dwell(self):
+        worker, events = self.make_worker(dwell_ms=500)
+
+        class FakeTargetMonitor:
+            current = "button-a"
+
+            def set_point(self, point):
+                pass
+
+            def target(self):
+                return self.current
+
+        monitor = FakeTargetMonitor()
+        worker.target_monitor = monitor
+        points = self.landmarks("open")
+        worker._hand_tracking(points, 1.0, True)
+        worker._hand_tracking(points, 1.3, True)  # target A settles, dwell arms
+        worker._hand_tracking(points, 1.6, True)
+        self.assertTrue(worker.dwell_armed)
+
+        monitor.current = "button-b"
+        worker._hand_tracking(points, 1.65, True)
+        monitor.current = "button-a"
+        worker._hand_tracking(points, 1.70, True)
+        worker._hand_tracking(points, 2.11, True)
         self.assertEqual(len(events), 1)
         self.assertEqual(events[0].payload["button"], "left")
 

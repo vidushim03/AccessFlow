@@ -166,7 +166,9 @@ POINTER_JUMP_LIMIT = 0.35
 # per-frame step clamp; that heavy low-pass is what keeps a still head from
 # dragging the pointer.
 HEAD_EMA_ALPHA = 0.18
-HAND_DWELL_STABILITY_RADIUS = 0.009
+HAND_DWELL_STABILITY_RADIUS = 0.018
+HAND_FINGER_EXTEND_ENTER_COS = 0.45
+HAND_FINGER_EXTEND_EXIT_COS = 0.20
 
 # Standard MediaPipe hand topology, used by the tracking preview to draw the
 # skeleton. Only the preview needs it; detection itself only returns points.
@@ -382,11 +384,16 @@ class VisionWorker(QThread):
         self.dwell_lock_anchor = None
         self.dwell_cooldown_until = 0.0
         self.hand_dwell_target = None
+        self.hand_target_candidate = None
+        self.hand_target_candidate_at = None
+        self.hand_target_stability_s = 0.20
         self.target_monitor = UIATargetMonitor()
         self.hand_suppressed_until = 0.0
         self.hand_pinched = False
         self.hand_pinch_enter_ratio = 0.32
         self.hand_pinch_exit_ratio = 0.48
+        self.hand_finger_extended = {
+            "index": False, "middle": False, "ring": False, "pinky": False}
         self.last_hand_seen = 0.0
         self.pointer_suspended_until = 0.0
         self.pointer_was_suspended = False
@@ -463,7 +470,11 @@ class VisionWorker(QThread):
         self.dwell_lock_anchor = None
         self.dwell_cooldown_until = 0.0
         self.hand_dwell_target = None
+        self.hand_target_candidate = None
+        self.hand_target_candidate_at = None
         self.hand_pinched = False
+        for finger in self.hand_finger_extended:
+            self.hand_finger_extended[finger] = False
         self.screen_dwell.reset()
         # Resume the relative hand pointer where the real cursor is, so the
         # first hand movement after a touchpad takeover continues from there.
@@ -671,8 +682,20 @@ class VisionWorker(QThread):
                             cursor[1] * (self.height - 1))
             self.target_monitor.set_point(screen_point)
             target = self.target_monitor.target()
-        if target != self.hand_dwell_target:
+        if target == self.hand_dwell_target:
+            self.hand_target_candidate = None
+            self.hand_target_candidate_at = None
+        elif target != self.hand_target_candidate:
+            self.hand_target_candidate = target
+            self.hand_target_candidate_at = now
+        elif (self.hand_target_candidate_at is not None
+              and now - self.hand_target_candidate_at >= self.hand_target_stability_s):
+            # Hit-testing can alternate between a control and its parent as
+            # the pointer jitters. Require the new target to persist briefly
+            # before resetting an otherwise stable hand dwell.
             self.hand_dwell_target = target
+            self.hand_target_candidate = None
+            self.hand_target_candidate_at = None
             self.dwell_armed = False
             self.dwell_started_at = None
             self.dwell_candidate_at = None
@@ -772,21 +795,43 @@ class VisionWorker(QThread):
                  if self.dwell_armed else "Move index to steer")
         return cursor, label
 
-    @staticmethod
-    def _hand_pose(points):
-        """Classify the index+middle right-click pose and open-hand shape."""
-        wrist = points[0]
+    def _hand_pose(self, points):
+        """Classify fingers from local joint direction with hysteresis.
 
-        def extended(tip, pip):
-            tip_point, pip_point = points[tip], points[pip]
-            return math.hypot(tip_point.x - wrist.x, tip_point.y - wrist.y) > (
-                math.hypot(pip_point.x - wrist.x, pip_point.y - wrist.y) * 1.12)
+        Wrist-to-tip distances changed too much as the hand rotated, making a
+        held two-finger pose flicker into the left-click state. Local MCP/PIP/
+        tip alignment is rotation-tolerant, and separate enter/exit thresholds
+        keep landmark noise from repeatedly changing the right-click pose.
+        """
+        finger_joints = (
+            ("index", 5, 6, 8), ("middle", 9, 10, 12),
+            ("ring", 13, 14, 16), ("pinky", 17, 18, 20),
+        )
+        extended = {}
+        for name, mcp_index, pip_index, tip_index in finger_joints:
+            mcp, pip, tip = points[mcp_index], points[pip_index], points[tip_index]
+            proximal = (pip.x - mcp.x, pip.y - mcp.y)
+            distal = (tip.x - pip.x, tip.y - pip.y)
+            proximal_length = math.hypot(*proximal)
+            distal_length = math.hypot(*distal)
+            previous = self.hand_finger_extended[name]
+            if proximal_length < 1e-4 or distal_length < 1e-4:
+                is_extended = previous
+            else:
+                alignment = ((proximal[0] * distal[0]
+                              + proximal[1] * distal[1])
+                             / (proximal_length * distal_length))
+                threshold = (HAND_FINGER_EXTEND_EXIT_COS if previous else
+                             HAND_FINGER_EXTEND_ENTER_COS)
+                is_extended = (alignment >= threshold
+                               and distal_length / proximal_length >= 0.45)
+            self.hand_finger_extended[name] = is_extended
+            extended[name] = is_extended
 
-        index, middle = extended(8, 6), extended(12, 10)
-        ring, pinky = extended(16, 14), extended(20, 18)
-        if index and middle and not ring and not pinky:
+        index_middle = extended["index"] and extended["middle"]
+        if index_middle and not extended["ring"] and not extended["pinky"]:
             return "two_fingers"
-        if index and middle and ring and pinky:
+        if all(extended.values()):
             return "open"
         return "other"
 
@@ -921,6 +966,11 @@ class VisionWorker(QThread):
                         self.dwell_lock_anchor = None
                         self.dwell_cooldown_until = 0.0
                         self.hand_pinched = False
+                        for finger in self.hand_finger_extended:
+                            self.hand_finger_extended[finger] = False
+                        self.hand_dwell_target = None
+                        self.hand_target_candidate = None
+                        self.hand_target_candidate_at = None
                         if self.preview == "hand":
                             preview_label = "Show your hand to the camera"
                 # A visible hand owns the camera interaction for this frame; this avoids gaze/gesture cursor contention.
