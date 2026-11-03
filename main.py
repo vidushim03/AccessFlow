@@ -586,7 +586,7 @@ class AccessFlowWindow(QMainWindow):
         pause.clicked.connect(self._pause)
         box.addWidget(pause, 0, Qt.AlignmentFlag.AlignLeft)
 
-        note = QLabel("Camera tracking combines head and hand input through one webcam owner. Voice recognition is local and needs an extracted Vosk model folder. Inputs start only when selected here.")
+        note = QLabel("Choose hand, head, or voice input. Camera tracking uses your webcam; voice input needs an offline speech model.")
         note.setObjectName("notice")
         note.setWordWrap(True)
         self.dashboard_note = note
@@ -607,9 +607,9 @@ class AccessFlowWindow(QMainWindow):
         box.addWidget(scroll, 1)
         self.input_checks = {}
         definitions = [
-            ("gestures", "Hand gestures", "Move with your index finger. Keep only the index fingertip still for a left-click dwell; your other fingers can be relaxed. Hold only index and middle fingers up for right click. Dwell restarts when Windows identifies a different control. Pinching does not click. If hand and face tracking are both enabled, the hand takes pointer priority while it is detected."),
-            ("voice", "Voice commands and dictation", "Say ‘left click’ or ‘right click’, ‘scroll up’ or ‘scroll down’, ‘open Notepad’ or ‘open Calculator’, or ‘pause AccessFlow’. For dictation, say ‘type’ followed by the words. Speech is processed locally; only Notepad and Calculator can be opened by voice."),
-            ("head", "Head tracking", "Moves the pointer from head movement relative to the neutral position learned at session start. Dwell over a control for the selected time to left-click; enable Voice for spoken right-click and other commands.")
+            ("gestures", "Hand gestures", "Move the pointer with your index finger. Hold it still for a left click, or raise index and middle fingers for a right click."),
+            ("voice", "Voice commands and dictation", "Dictate text by saying ‘type’ followed by the words. Use voice commands to click, scroll, or pause AccessFlow. Speech is processed locally."),
+            ("head", "Head tracking", "Move the pointer with your head. Hold it steady for the selected time to left-click; enable Voice for spoken commands.")
         ]
         for key, title, detail in definitions:
             card = self._card(title, detail)
@@ -1010,14 +1010,14 @@ class AccessFlowWindow(QMainWindow):
         page, box = self._page("Accessibility", "Settings are stored locally on this computer.")
         keyboard = self._card(
             "On-screen keyboard",
-            "Open AccessFlow’s keyboard, select a text field in the app you want to type into, then click or dwell on keys. The keyboard stays on top without taking text focus, so it also works with the touchpad when camera input is paused.")
+            "Select a text field in the app you want to type into, then dwell on keys in AccessFlow’s keyboard.")
         open_keyboard = QPushButton("Open AccessFlow Keyboard")
         open_keyboard.setObjectName("secondaryAction")
         open_keyboard.setMinimumHeight(42)
         open_keyboard.clicked.connect(self._show_accessflow_keyboard)
         keyboard.layout().addWidget(open_keyboard)
         box.addWidget(keyboard)
-        dwell = self._card("Dwell selection", "Hand: keep only your index fingertip still for a left click; your other fingers can be relaxed. For right click, raise only index and middle fingers and keep the index fingertip still. Pinching does not click. Head tracking: hold the pointer over a control for a left click. When Windows exposes the control, dwell follows that target and restarts if it changes; otherwise it uses a small screen area. The timer below applies to hand and head. Enable Voice to say ‘left click’ or ‘right click’ with any pointer method.")
+        dwell = self._card("Dwell selection", "Hand: hold your index finger still for a left click, or raise index and middle fingers for a right click. Head: hold the pointer steady for a left click. Choose how long to dwell below. Voice can also perform left and right clicks.")
         value = QLabel("1200 ms")
         self.dwell_slider = QSlider(Qt.Orientation.Horizontal)
         self.dwell_slider.setRange(500, 3000)
@@ -1059,9 +1059,13 @@ class AccessFlowWindow(QMainWindow):
             payload.get("point", (0, 0)), payload.get("progress", 0.0), scale)
 
     def _about(self):
-        page, box = self._page("About AccessFlow", "Adaptive multimodal assistive computer interaction.")
-        box.addWidget(self._card("Interaction engine", "Every provider emits a typed event. The coordinator checks session state, source, and confidence before routing desktop actions."))
-        box.addWidget(self._card("Windows integration", "PyAutoGUI handles pointer and keyboard actions; pywinauto supports named UI controls and window activation. Application launching is restricted to Notepad and Calculator."))
+        page, box = self._page(
+            "About AccessFlow",
+            "An accessibility app for pointer control, dwell selection, voice input, and on-screen typing.")
+        box.addWidget(self._card(
+            "Basic features",
+            "Use hand or head movement to control the pointer, dwell to click, "
+            "speak commands or dictate text, and type with the built-in keyboard."))
         box.addStretch()
         return page
 
