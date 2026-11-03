@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 import json
-import os
-import subprocess
 import sys
 import time
 import warnings
@@ -1018,10 +1016,6 @@ class AccessFlowWindow(QMainWindow):
         open_keyboard.setMinimumHeight(42)
         open_keyboard.clicked.connect(self._show_accessflow_keyboard)
         keyboard.layout().addWidget(open_keyboard)
-        windows_keyboard = QPushButton("Try Windows On-Screen Keyboard")
-        windows_keyboard.setMinimumHeight(38)
-        windows_keyboard.clicked.connect(self._open_onscreen_keyboard)
-        keyboard.layout().addWidget(windows_keyboard)
         box.addWidget(keyboard)
         dwell = self._card("Dwell selection", "Hand: keep only your index fingertip still for a left click; your other fingers can be relaxed. For right click, raise only index and middle fingers and keep the index fingertip still. Pinching does not click. Head tracking: hold the pointer over a control for a left click. When Windows exposes the control, dwell follows that target and restarts if it changes; otherwise it uses a small screen area. The timer below applies to hand and head. Enable Voice to say ‘left click’ or ‘right click’ with any pointer method.")
         value = QLabel("1200 ms")
@@ -1066,41 +1060,6 @@ class AccessFlowWindow(QMainWindow):
         scale = screen.devicePixelRatio() if screen is not None else 1.0
         self.dwell_feedback_overlay.show_progress(
             payload.get("point", (0, 0)), payload.get("progress", 0.0), scale)
-
-    def _open_onscreen_keyboard(self):
-        keyboard_path = Path(os.environ.get("WINDIR", r"C:\Windows")) / "System32" / "osk.exe"
-        touch_keyboard_path = (
-            Path(os.environ.get("ProgramFiles", r"C:\Program Files"))
-            / "Common Files" / "Microsoft Shared" / "Ink" / "TabTip.exe")
-        try:
-            if not keyboard_path.is_file():
-                raise FileNotFoundError(f"Windows On-Screen Keyboard was not found at {keyboard_path}")
-            subprocess.Popen([str(keyboard_path)])
-            self.status_label.setText("Windows On-Screen Keyboard opened")
-        except OSError as exc:
-            if getattr(exc, "winerror", None) == 740:
-                self.status_label.setText("Windows blocked the on-screen keyboard (elevation required)")
-                QMessageBox.information(
-                    self, "Windows blocked the on-screen keyboard",
-                    "Windows requires elevation to open its built-in on-screen keyboard on this computer. "
-                    "AccessFlow runs without administrator privileges and cannot safely bypass that Windows policy.\n\n"
-                    "Open Settings → Accessibility → Keyboard and turn on On-Screen Keyboard. "
-                    "If Windows shows the same elevation message there, ask your device administrator to enable it."
-                )
-                return
-            try:
-                if not touch_keyboard_path.is_file():
-                    raise FileNotFoundError(
-                        f"Windows Touch Keyboard was not found at {touch_keyboard_path}")
-                subprocess.Popen([str(touch_keyboard_path)])
-                self.status_label.setText(
-                    "Classic On-Screen Keyboard was blocked; Windows Touch Keyboard opened")
-            except OSError as fallback_error:
-                QMessageBox.warning(
-                    self, "On-Screen Keyboard unavailable",
-                    f"Windows could not open the classic keyboard: {exc}\n\n"
-                    f"The Windows Touch Keyboard fallback also failed: {fallback_error}\n\n"
-                    "AccessFlow does not request administrator privileges. Open Settings → Accessibility → Keyboard and turn on On-Screen Keyboard.")
 
     def _about(self):
         page, box = self._page("About AccessFlow", "Adaptive multimodal assistive computer interaction.")
