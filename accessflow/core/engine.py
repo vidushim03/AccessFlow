@@ -20,6 +20,7 @@ class InteractionEngine:
         "type_text": 0.60,
         "click": 0.65,
         "click_target": 0.65,
+        "press_key": 0.60,
         "open_application": 0.60,
     }
 

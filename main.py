@@ -608,7 +608,7 @@ class AccessFlowWindow(QMainWindow):
         self.input_checks = {}
         definitions = [
             ("gestures", "Hand gestures", "Move the pointer with your index finger. Hold it still for a left click, or raise index and middle fingers for a right click."),
-            ("voice", "Voice commands and dictation", "Dictate text by saying ‘type’ followed by the words. Use voice commands to click, scroll, or pause AccessFlow. Speech is processed locally."),
+            ("voice", "Voice commands and dictation", "Dictate text by saying ‘type’ followed by the words. Say ‘space’ or ‘new line’ to format text. Voice commands also support clicking, scrolling, and pausing AccessFlow. Speech is processed locally."),
             ("head", "Head tracking", "Move the pointer with your head. Hold it steady for the selected time to left-click; enable Voice for spoken commands.")
         ]
         for key, title, detail in definitions:

@@ -21,6 +21,7 @@ DICTATION_MIN_CONFIDENCE = 0.60
 # Average confidence is more reliable than rejecting the phrase for one weak
 # word, while the whitelist still prevents arbitrary program execution.
 OPEN_APP_MIN_CONFIDENCE = 0.60
+KEY_COMMAND_MIN_CONFIDENCE = 0.60
 # A correct left-click command can have one weakly scored word (often "left")
 # even when the phrase as a whole is clear. Keep an exact-phrase check and use
 # average word confidence, while leaving destructive/open/scroll commands at
@@ -132,6 +133,16 @@ class VoiceWorker(QThread):
                 "voice", "command", "click", round(average, 3),
                 {"button": "left"}))
             return
+        if text in ("space", "new line", "next line", "line break"):
+            if average < KEY_COMMAND_MIN_CONFIDENCE:
+                self.status.emit(
+                    f"Didn’t catch ‘{text}’ clearly; please repeat the command")
+                return
+            key = "space" if text == "space" else "enter"
+            self.event_ready.emit(InteractionEvent(
+                "voice", "command", "press_key", round(average, 3),
+                {"key": key}))
+            return
         if text in ("open notepad", "open calculator"):
             if average < OPEN_APP_MIN_CONFIDENCE:
                 self.status.emit(
@@ -145,6 +156,7 @@ class VoiceWorker(QThread):
             return
         if confidence < COMMAND_MIN_CONFIDENCE:
             if text in ("right click", "scroll up", "scroll down",
+                        "space", "new line", "next line", "line break",
                         "pause accessflow", "stop accessflow",
                         "emergency pause"):
                 self.status.emit(

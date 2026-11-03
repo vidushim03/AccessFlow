@@ -200,6 +200,16 @@ class VoicePhraseTests(unittest.TestCase):
         self.assertEqual(self.events, [])
         self.assertIn("repeat the command", self.statuses[-1])
 
+    def test_space_voice_command_presses_space(self):
+        self.worker._phrase("space", 0.82, average=0.82)
+        self.assertEqual(self.events[0].action, "press_key")
+        self.assertEqual(self.events[0].payload["key"], "space")
+
+    def test_new_line_voice_command_presses_enter(self):
+        self.worker._phrase("next line", 0.78, average=0.78)
+        self.assertEqual(self.events[0].action, "press_key")
+        self.assertEqual(self.events[0].payload["key"], "enter")
+
     def test_dictation_preserves_recognized_case(self):
         self.worker._phrase("type Hello World", 0.8, average=0.8)
         self.assertEqual(self.events[0].payload["text"], "Hello World")
