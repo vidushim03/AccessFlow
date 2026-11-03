@@ -764,10 +764,8 @@ class VisionWorker(QThread):
                         "progress": 1.0})
                     if not self.preview:
                         self.event_ready.emit(InteractionEvent(
-                            "gestures", "dwell", "click_target", 0.90, {
-                                "button": button,
-                                "x": int(cursor[0] * (self.width - 1)),
-                                "y": int(cursor[1] * (self.height - 1))}))
+                            "gestures", "dwell", "click", 0.90,
+                            {"button": button}))
                     self.dwell_cooldown_until = now + 0.45
                     self.dwell_armed = False
                     self.dwell_started_at = None

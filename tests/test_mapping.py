@@ -165,6 +165,8 @@ class HandDwellTests(unittest.TestCase):
         worker._hand_tracking(points, 1.3, True)  # pose debounce arms dwell
         worker._hand_tracking(points, 1.8, True)  # completes selected 500 ms
         self.assertEqual(len(events), 1)
+        self.assertEqual(events[0].action, "click")
+        self.assertEqual(events[0].payload["button"], "left")
 
         worker._hand_tracking(points, 2.2, True)
         worker._hand_tracking(points, 2.7, True)
@@ -308,6 +310,7 @@ class HandDwellTests(unittest.TestCase):
         worker._hand_tracking(points, 1.3, True)
         worker._hand_tracking(points, 1.8, True)
         self.assertEqual(len(events), 1)
+        self.assertEqual(events[0].action, "click")
         self.assertEqual(events[0].payload["button"], "right")
 
     def test_ambiguous_outer_fingers_do_not_turn_left_dwell_into_right(self):
