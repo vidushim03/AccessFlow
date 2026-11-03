@@ -22,8 +22,8 @@ import numpy as np
 
 # Keep hand response quick enough to follow slow intentional movement while
 # retaining a modest jitter threshold and per-frame speed cap.
-HAND_SENSITIVITY = 1.4
-HAND_DEAD_ZONE = 0.009
+HAND_SENSITIVITY = 1.6
+HAND_DEAD_ZONE = 0.008
 HAND_MAX_DELTA_PX = 220.0
 # Keep the reference fixed below the threshold. This prevents small landmark
 # jitter from accumulating into cursor motion; intended movement accumulates
