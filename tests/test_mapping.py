@@ -176,6 +176,29 @@ class HandDwellTests(unittest.TestCase):
         self.assertFalse(worker.dwell_locked)
         self.assertEqual(len(events), 1)
 
+    def test_click_latch_prevents_repeat_clicks_without_freezing_pointer(self):
+        worker, events = self.make_worker(dwell_ms=500)
+        still = self.landmarks("open")
+        worker._hand_tracking(still, 1.0, True)
+        worker._hand_tracking(still, 1.3, True)
+        worker._hand_tracking(still, 1.81, True)
+        self.assertTrue(worker.dwell_locked)
+        self.assertEqual(len(events), 1)
+        before = worker.hand_pointer.position
+
+        # Movement before the re-arm distance still moves the pointer, but
+        # the one-shot latch suppresses another click.
+        worker._hand_tracking(
+            self.landmarks("open", index=(0.525, 0.3)), 1.9, True)
+        self.assertTrue(worker.dwell_locked)
+        self.assertGreater(worker.hand_pointer.position[0], before[0])
+        self.assertEqual(len(events), 1)
+
+        worker._hand_tracking(
+            self.landmarks("open", index=(0.54, 0.3)), 2.0, True)
+        self.assertFalse(worker.dwell_locked)
+        self.assertEqual(len(events), 1)
+
     def test_small_index_jitter_does_not_restart_dwell(self):
         worker, events = self.make_worker(dwell_ms=500)
         worker._hand_tracking(self.landmarks("open"), 1.0, True)

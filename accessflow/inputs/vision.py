@@ -668,7 +668,10 @@ class VisionWorker(QThread):
                     "right" if pose == "two_fingers" else "left")
                 self.dwell_pointer_anchor = None
             else:
-                cursor = self.hand_pointer.position
+                # Keep steering available after a click. The latch blocks a
+                # second click until the index moves away, but it must not
+                # freeze the cursor while waiting for that movement.
+                cursor = self.hand_pointer.update(index_tip.x, index_tip.y)
                 return cursor, "Move away to re-arm clicking"
         # Keep mapping the fingertip during dwell. Freezing output made hand
         # control appear to stop as soon as the timer armed. Dwell is canceled
@@ -944,11 +947,10 @@ class VisionWorker(QThread):
                             if not self.preview:
                                 self.pointer_source = "gestures"
                                 self.pointer_last = cursor
-                                if not self.dwell_locked:
-                                    self.event_ready.emit(InteractionEvent(
-                                        "gestures", "pointer", "move_pointer", 0.86, {
-                                            "x": int(cursor[0] * (self.width - 1)),
-                                            "y": int(cursor[1] * (self.height - 1))}))
+                                self.event_ready.emit(InteractionEvent(
+                                    "gestures", "pointer", "move_pointer", 0.86, {
+                                        "x": int(cursor[0] * (self.width - 1)),
+                                        "y": int(cursor[1] * (self.height - 1))}))
                         else:
                             preview_label = "Pointer handed to touchpad"
                     else:
