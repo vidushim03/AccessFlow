@@ -325,13 +325,23 @@ class HandDwellTests(unittest.TestCase):
         self.assertEqual(len(events), 1)
         self.assertEqual(events[0].payload["button"], "left")
 
+    def test_index_only_dwell_is_left_click(self):
+        worker, events = self.make_worker()
+        points = self.landmarks("two_fingers")
+        points[12] = SimpleNamespace(x=points[12].x, y=0.65)
+        worker._hand_tracking(points, 1.0, True)
+        worker._hand_tracking(points, 1.3, True)
+        worker._hand_tracking(points, 1.8, True)
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0].payload["button"], "left")
+
     def test_right_click_pose_survives_shorter_extended_finger_landmarks(self):
         worker, events = self.make_worker()
         points = self.landmarks("two_fingers")
         # A slightly foreshortened fingertip is common when the hand tilts.
         # Keep the fingertip aligned with the finger while shortening its
         # distal segment; this should still count as an extended middle finger.
-        points[12] = SimpleNamespace(x=points[12].x, y=0.34)
+        points[12] = SimpleNamespace(x=points[12].x, y=0.31)
         worker._hand_tracking(points, 1.0, True)
         worker._hand_tracking(points, 1.3, True)
         worker._hand_tracking(points, 1.8, True)

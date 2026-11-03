@@ -839,16 +839,21 @@ class VisionWorker(QThread):
             self.hand_finger_extended[name] = is_extended
             extended[name] = is_extended
 
-        index_middle = extended["index"] and extended["middle"]
+        right_control_fingers_extended = all(
+            alignment_by_finger[name] is not None
+            and length_ratio_by_finger[name] is not None
+            and alignment_by_finger[name] >= HAND_FINGER_EXTEND_ENTER_COS
+            and length_ratio_by_finger[name] >= 0.45
+            for name in ("index", "middle"))
         # A right click is an intentional V pose: both control fingers are
         # extended, and both outer fingers show clear curl geometry. Requiring
         # current-frame evidence avoids stale hysteresis or a mildly bent open
         # hand turning an ordinary left dwell into a right click.
         outer_fingers_clearly_curled = all(
             alignment_by_finger[name] is not None
-            and alignment_by_finger[name] < 0.10
+            and alignment_by_finger[name] < 0.25
             for name in ("ring", "pinky"))
-        if index_middle and outer_fingers_clearly_curled:
+        if right_control_fingers_extended and outer_fingers_clearly_curled:
             return "two_fingers"
         if all(extended.values()):
             return "open"
