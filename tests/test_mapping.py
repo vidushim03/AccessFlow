@@ -62,6 +62,7 @@ class RelativePointerTests(unittest.TestCase):
 
     def test_movement_moves_the_pointer(self):
         self.pointer.update(0.40, 0.40)
+        self.pointer.update(0.42, 0.40)
         x, y = self.pointer.update(0.42, 0.40)
         self.assertGreater(x, 0.5)
         self.assertAlmostEqual(y, 0.5, places=6)
@@ -76,6 +77,14 @@ class RelativePointerTests(unittest.TestCase):
                 0.40 + float(rng.normal(0, 0.003)),
                 0.40 + float(rng.normal(0, 0.003)))
         self.assertEqual(position, (0.5, 0.5))
+
+    def test_single_frame_landmark_spike_does_not_drag_pointer(self):
+        for _ in range(5):
+            self.pointer.update(0.40, 0.40)
+        before = self.pointer.position
+        self.pointer.update(0.43, 0.37)
+        self.pointer.update(0.40, 0.40)
+        self.assertEqual(self.pointer.position, before)
 
     def test_slow_deliberate_motion_is_not_swallowed(self):
         self.pointer.update(0.40, 0.40)
@@ -95,6 +104,7 @@ class RelativePointerTests(unittest.TestCase):
         self.assertEqual(self.pointer.update(0.90, 0.90), before)
         self.assertEqual(self.pointer.update(0.90, 0.90), before)
         # Movement after reacquisition continues normally.
+        self.pointer.update(0.92, 0.90)
         self.assertNotEqual(self.pointer.update(0.92, 0.90), before)
 
     def test_fast_glitch_is_clamped(self):
@@ -193,6 +203,8 @@ class HandDwellTests(unittest.TestCase):
         worker._hand_tracking(
             self.landmarks("open", index=(0.525, 0.3)), 1.9, True)
         self.assertTrue(worker.dwell_locked)
+        worker._hand_tracking(
+            self.landmarks("open", index=(0.525, 0.3)), 1.92, True)
         self.assertGreater(worker.hand_pointer.position[0], before[0])
         self.assertEqual(len(events), 1)
 
@@ -245,6 +257,7 @@ class HandDwellTests(unittest.TestCase):
         # of being swallowed by the armed state.
         moved = self.landmarks("open", index=(0.53, 0.3))
         worker._hand_tracking(moved, 1.35, True)
+        worker._hand_tracking(moved, 1.37, True)
         self.assertGreater(worker.hand_pointer.position[0], before[0])
         self.assertFalse(worker.dwell_armed)
         self.assertEqual(events, [])
